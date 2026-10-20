@@ -1,0 +1,259 @@
+{
+  "metadata": {
+    "total_predictions_generated": 251,
+    "evaluated_predictions_count": 250,
+    "unrealized_target_sessions_count": 1,
+    "sentiment_covered_evaluated_count": 33,
+    "last_realized_evaluation_date": "2026-10-16",
+    "last_prediction_date": "2026-10-19",
+    "walk_forward_evaluation_range": {
+      "start_date": "2025-10-20",
+      "end_date": "2026-10-16"
+    },
+    "sentiment_covered_range": {
+      "start_date": "2026-09-01",
+      "end_date": "2026-10-16"
+    },
+    "r2_metric_definitions": {
+      "r2_vs_zero_benchmark": "1 - sum((y - y_hat)^2) / sum(y^2). Out-of-sample R\u00b2 versus driftless zero-return benchmark (denominator: sum of squared realized returns).",
+      "r2_descriptive_test_mean": "1 - sum((y - y_hat)^2) / sum((y - mean(y_test))^2). Descriptive test-period variance explained relative to in-sample test-period mean."
+    },
+    "statistical_limitation_notice": "The sentiment-covered test subset contains only 33 evaluated sessions. Confidence intervals are wide, and results must be interpreted as exploratory proof-of-concept rather than statistically significant alpha at p < 0.05."
+  },
+  "full_walk_forward_window": {
+    "naive_zero": {
+      "n_samples": 250,
+      "rmse": 0.015196013244649908,
+      "mae": 0.01084064377781021,
+      "r2_vs_zero_benchmark": 0.0,
+      "r2_descriptive_test_mean": -0.006315463721054293,
+      "directional_accuracy": 0.464,
+      "spearman_ic": 0.0,
+      "spearman_pvalue": 1.0,
+      "exploratory_strategy": {
+        "is_exploratory_proxy": true,
+        "caveat": "Unadjusted for transaction costs, execution lag, market impact, and borrow fees.",
+        "cumulative_return": -0.28089950974722044,
+        "annualized_return": -0.3033651953530108,
+        "annualized_volatility": 0.24095347353776797,
+        "annualized_sharpe": -1.259019805354498
+      }
+    },
+    "naive_lag": {
+      "n_samples": 250,
+      "rmse": 0.021289284371977604,
+      "mae": 0.016094162704891557,
+      "r2_vs_zero_benchmark": -0.9627401177308357,
+      "r2_descriptive_test_mean": -0.9751357317382225,
+      "directional_accuracy": 0.476,
+      "spearman_ic": -0.0007238515816253059,
+      "spearman_pvalue": 0.99091409264288,
+      "exploratory_strategy": {
+        "is_exploratory_proxy": true,
+        "caveat": "Unadjusted for transaction costs, execution lag, market impact, and borrow fees.",
+        "cumulative_return": -0.10979630182484179,
+        "annualized_return": -0.08826803464832779,
+        "annualized_volatility": 0.2416489218537247,
+        "annualized_sharpe": -0.3652738608192853
+      }
+    },
+    "ridge_tech": {
+      "n_samples": 250,
+      "rmse": 0.015287801642702272,
+      "mae": 0.010877901917056242,
+      "r2_vs_zero_benchmark": -0.012117074532200789,
+      "r2_descriptive_test_mean": -0.018509063197868603,
+      "directional_accuracy": 0.512,
+      "spearman_ic": -0.01577535640570249,
+      "spearman_pvalue": 0.8039829917439898,
+      "exploratory_strategy": {
+        "is_exploratory_proxy": true,
+        "caveat": "Unadjusted for transaction costs, execution lag, market impact, and borrow fees.",
+        "cumulative_return": -0.04545766441123966,
+        "annualized_return": -0.017804590202422962,
+        "annualized_volatility": 0.24171052985087785,
+        "annualized_sharpe": -0.07366079671170064
+      }
+    },
+    "hgb_tech": {
+      "n_samples": 250,
+      "rmse": 0.015578364153665234,
+      "mae": 0.011142310157946218,
+      "r2_vs_zero_benchmark": -0.050955618288067495,
+      "r2_descriptive_test_mean": -0.05759289036780402,
+      "directional_accuracy": 0.484,
+      "spearman_ic": -0.09671233139730234,
+      "spearman_pvalue": 0.12724167229982716,
+      "exploratory_strategy": {
+        "is_exploratory_proxy": true,
+        "caveat": "Unadjusted for transaction costs, execution lag, market impact, and borrow fees.",
+        "cumulative_return": -0.3116563686422865,
+        "annualized_return": -0.3471833834733734,
+        "annualized_volatility": 0.24071768449095282,
+        "annualized_sharpe": -1.4422844927557534
+      }
+    },
+    "ridge_hybrid": {
+      "n_samples": 250,
+      "rmse": 0.016321171590358407,
+      "mae": 0.0114080831901084,
+      "r2_vs_zero_benchmark": -0.1535683569483446,
+      "r2_descriptive_test_mean": -0.1608536760564081,
+      "directional_accuracy": 0.488,
+      "spearman_ic": -0.05168069889118226,
+      "spearman_pvalue": 0.4158785473996605,
+      "exploratory_strategy": {
+        "is_exploratory_proxy": true,
+        "caveat": "Unadjusted for transaction costs, execution lag, market impact, and borrow fees.",
+        "cumulative_return": -0.10565914830690815,
+        "annualized_return": -0.08349423668017843,
+        "annualized_volatility": 0.2416556812981076,
+        "annualized_sharpe": -0.34550909886194453
+      }
+    },
+    "hgb_hybrid": {
+      "n_samples": 250,
+      "rmse": 0.015578364153665234,
+      "mae": 0.011142310157946218,
+      "r2_vs_zero_benchmark": -0.050955618288067495,
+      "r2_descriptive_test_mean": -0.05759289036780402,
+      "directional_accuracy": 0.484,
+      "spearman_ic": -0.09671233139730234,
+      "spearman_pvalue": 0.12724167229982716,
+      "exploratory_strategy": {
+        "is_exploratory_proxy": true,
+        "caveat": "Unadjusted for transaction costs, execution lag, market impact, and borrow fees.",
+        "cumulative_return": -0.3116563686422865,
+        "annualized_return": -0.3471833834733734,
+        "annualized_volatility": 0.24071768449095282,
+        "annualized_sharpe": -1.4422844927557534
+      }
+    }
+  },
+  "sentiment_covered_subwindow": {
+    "naive_zero": {
+      "n_samples": 33,
+      "rmse": 0.01192942328556384,
+      "mae": 0.008934399899225263,
+      "r2_vs_zero_benchmark": 0.0,
+      "r2_descriptive_test_mean": -0.02040601531009356,
+      "directional_accuracy": 0.45454545454545453,
+      "spearman_ic": 0.0,
+      "spearman_pvalue": 1.0,
+      "exploratory_strategy": {
+        "is_exploratory_proxy": true,
+        "caveat": "Unadjusted for transaction costs, execution lag, market impact, and borrow fees.",
+        "cumulative_return": -0.056376547639427455,
+        "annualized_return": -0.42512102922759043,
+        "annualized_volatility": 0.19037731385597068,
+        "annualized_sharpe": -2.2330445819254194
+      }
+    },
+    "naive_lag": {
+      "n_samples": 33,
+      "rmse": 0.01748953254474353,
+      "mae": 0.014731047400398474,
+      "r2_vs_zero_benchmark": -1.149401296289036,
+      "r2_descriptive_test_mean": -1.193262012048645,
+      "directional_accuracy": 0.36363636363636365,
+      "spearman_ic": -0.1681149732620321,
+      "spearman_pvalue": 0.3496909925288374,
+      "exploratory_strategy": {
+        "is_exploratory_proxy": true,
+        "caveat": "Unadjusted for transaction costs, execution lag, market impact, and borrow fees.",
+        "cumulative_return": -0.08090521436579723,
+        "annualized_return": -0.6262029003302315,
+        "annualized_volatility": 0.18809148978991205,
+        "annualized_sharpe": -3.329246320658452
+      }
+    },
+    "ridge_tech": {
+      "n_samples": 33,
+      "rmse": 0.012229838936955692,
+      "mae": 0.00918978502284144,
+      "r2_vs_zero_benchmark": -0.0509996652510194,
+      "r2_descriptive_test_mean": -0.07244638051103491,
+      "directional_accuracy": 0.5454545454545454,
+      "spearman_ic": -0.20521390374331552,
+      "spearman_pvalue": 0.2519385717227772,
+      "exploratory_strategy": {
+        "is_exploratory_proxy": true,
+        "caveat": "Unadjusted for transaction costs, execution lag, market impact, and borrow fees.",
+        "cumulative_return": -0.022052860463911195,
+        "annualized_return": -0.15218504010017753,
+        "annualized_volatility": 0.1920633477018634,
+        "annualized_sharpe": -0.7923689861764345
+      }
+    },
+    "hgb_tech": {
+      "n_samples": 33,
+      "rmse": 0.01202709228133382,
+      "mae": 0.009053506030948094,
+      "r2_vs_zero_benchmark": -0.016441501478949405,
+      "r2_descriptive_test_mean": -0.03718302231994319,
+      "directional_accuracy": 0.42424242424242425,
+      "spearman_ic": -0.21290106951871657,
+      "spearman_pvalue": 0.23421810769459142,
+      "exploratory_strategy": {
+        "is_exploratory_proxy": true,
+        "caveat": "Unadjusted for transaction costs, execution lag, market impact, and borrow fees.",
+        "cumulative_return": -0.10254399431330619,
+        "annualized_return": -0.8080564569307326,
+        "annualized_volatility": 0.18523240441136388,
+        "annualized_sharpe": -4.362392527908896
+      }
+    },
+    "ridge_hybrid": {
+      "n_samples": 33,
+      "rmse": 0.019925403648104054,
+      "mae": 0.013206309818691123,
+      "r2_vs_zero_benchmark": -1.7898147028117295,
+      "r2_descriptive_test_mean": -1.8467437043496298,
+      "directional_accuracy": 0.36363636363636365,
+      "spearman_ic": -0.3201871657754011,
+      "spearman_pvalue": 0.06928243224039538,
+      "exploratory_strategy": {
+        "is_exploratory_proxy": true,
+        "caveat": "Unadjusted for transaction costs, execution lag, market impact, and borrow fees.",
+        "cumulative_return": -0.08373044853577394,
+        "annualized_return": -0.6498338770528704,
+        "annualized_volatility": 0.1877631765943579,
+        "annualized_sharpe": -3.4609228968082837
+      }
+    },
+    "hgb_hybrid": {
+      "n_samples": 33,
+      "rmse": 0.01202709228133382,
+      "mae": 0.009053506030948094,
+      "r2_vs_zero_benchmark": -0.016441501478949405,
+      "r2_descriptive_test_mean": -0.03718302231994319,
+      "directional_accuracy": 0.42424242424242425,
+      "spearman_ic": -0.21290106951871657,
+      "spearman_pvalue": 0.23421810769459142,
+      "exploratory_strategy": {
+        "is_exploratory_proxy": true,
+        "caveat": "Unadjusted for transaction costs, execution lag, market impact, and borrow fees.",
+        "cumulative_return": -0.10254399431330619,
+        "annualized_return": -0.8080564569307326,
+        "annualized_volatility": 0.18523240441136388,
+        "annualized_sharpe": -4.362392527908896
+      }
+    }
+  },
+  "ablation_deltas_on_covered": {
+    "ridge_delta": {
+      "delta_rmse": 0.007695564711148363,
+      "delta_mae": 0.0040165247958496835,
+      "delta_r2_vs_zero": -1.73881503756071,
+      "delta_da": -0.18181818181818177,
+      "delta_ic": -0.11497326203208555
+    },
+    "hgb_delta": {
+      "delta_rmse": 0.0,
+      "delta_mae": 0.0,
+      "delta_r2_vs_zero": 0.0,
+      "delta_da": 0.0,
+      "delta_ic": 0.0
+    }
+  }
+}
