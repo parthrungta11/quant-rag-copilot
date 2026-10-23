@@ -20,17 +20,26 @@ import unittest
 from pathlib import Path
 import tempfile
 
+from unittest.mock import patch
+from typing import Any
+
 import numpy as np
 import pandas as pd
 
 from src.data_ingestion.news_sentiment import (
     SENTIMENT_METRIC_COLUMNS,
+    STATUS_COMPLETE,
+    STATUS_FAILED,
+    STATUS_PARTIAL,
     assign_trading_session,
     deduplicate_articles,
+    fetch_finnhub_news,
+    fetch_news,
     filter_news_by_date_range,
     get_us_equity_market_holidays,
     is_us_equity_early_close,
     merge_sentiment_with_market_features,
+    run_production_pipeline,
 )
 
 
@@ -463,6 +472,336 @@ class TestIncrementalSentimentMerge(unittest.TestCase):
         covered_rows = merged[merged["sentiment_coverage"] == 1]
         self.assertEqual(len(covered_rows), 1)
         self.assertTrue(covered_rows["sentiment_score"].notna().all())
+
+
+class TestFinnhubRetrievalOutcomes(unittest.TestCase):
+    """Test complete empty retrieval, partial chunk failure, and total failure distinction.
+
+    Validates:
+    1. Complete: All chunks retrieved successfully (even if 0 articles) -> status=complete.
+    2. Partial: Some chunks failed, >= 1 succeeded -> articles preserved, status=partial.
+    3. Failed: All chunks failed -> status=failed, not silently treated as successful empty.
+    4. Pipeline safety: Partial refresh updates only observed dates, preserving unretrieved dates.
+    5. Pipeline safety: Total failure aborts without clearing/overwriting historical sentiment.
+    """
+
+    def setUp(self) -> None:
+        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_dir_path = Path(self.temp_dir.name)
+        self.market_file = self.temp_dir_path / "market_features.parquet"
+        self.raw_news_file = self.temp_dir_path / "raw_news.parquet"
+        self.processed_news_file = self.temp_dir_path / "processed_news.parquet"
+
+        # Synthetic 5 trading days
+        self.dates = pd.date_range("2026-10-12", periods=5, freq="B")
+        self.market_df = pd.DataFrame(
+            {
+                "Close": [100.0, 101.0, 102.0, 103.0, 104.0],
+                "Daily_Return": [0.01, 0.01, 0.01, 0.01, 0.01],
+            },
+            index=self.dates,
+        )
+        self.market_df.index.name = "Date"
+        self.market_df.to_parquet(self.market_file)
+
+    def tearDown(self) -> None:
+        self.temp_dir.cleanup()
+
+    class MockFinnhubClient:
+        def __init__(self, chunk_map: dict[str | tuple[str, str], Any]) -> None:
+            self.chunk_map = chunk_map
+
+        def company_news(self, ticker: str, _from: str, to: str) -> list[dict[str, Any]]:
+            val = self.chunk_map.get((_from, to))
+            if val is None:
+                val = self.chunk_map.get(_from)
+            if isinstance(val, Exception):
+                raise val
+            return val if val is not None else []
+
+    class MockAnalyzer:
+        def analyze_batch(self, headlines: list[str], batch_size: int = 32) -> pd.DataFrame:
+            return pd.DataFrame(
+                [
+                    {
+                        "sentiment_label": "positive",
+                        "sentiment_score": 0.5,
+                        "prob_positive": 0.8,
+                        "prob_negative": 0.1,
+                        "prob_neutral": 0.1,
+                    }
+                    for _ in headlines
+                ]
+            )
+
+    def test_complete_empty_retrieval(self) -> None:
+        """All chunks succeed with 0 articles -> status is complete (not failed)."""
+        client = self.MockFinnhubClient({
+            "2026-10-12": [],
+            "2026-10-13": [],
+        })
+        finnhub_df = fetch_finnhub_news("AAPL", "2026-10-12", "2026-10-13", client=client, retry_delay=0.0)
+        self.assertTrue(finnhub_df.empty)
+        self.assertEqual(finnhub_df.attrs["status"], STATUS_COMPLETE)
+        self.assertEqual(finnhub_df.attrs["failed_chunks"], [])
+        self.assertEqual(finnhub_df.attrs["total_chunks"], 2)
+
+        with patch("src.data_ingestion.news_sentiment.fetch_yahoo_fallback", return_value=pd.DataFrame()):
+            news_df = fetch_news(
+                "AAPL",
+                start_date="2026-10-12",
+                end_date="2026-10-13",
+                client=client,
+                retry_delay=0.0,
+            )
+            self.assertTrue(news_df.empty)
+            self.assertEqual(news_df.attrs["status"], STATUS_COMPLETE)
+            self.assertNotEqual(news_df.attrs["status"], STATUS_FAILED)
+
+        res = run_production_pipeline(
+            start_date="2026-10-12",
+            end_date="2026-10-13",
+            client=client,
+            market_features_path=self.market_file,
+            raw_news_path=self.raw_news_file,
+            processed_news_path=self.processed_news_file,
+            analyzer=self.MockAnalyzer(),
+            retry_delay=0.0,
+        )
+        self.assertEqual(res["status"], STATUS_COMPLETE)
+        self.assertEqual(res["raw_news_count"], 0)
+        self.assertFalse(self.raw_news_file.exists())
+
+    def test_partial_chunk_failure_preserves_articles_and_exposes_status(self) -> None:
+        """Some chunks fail but >= 1 chunk succeeds -> returns preserved articles and status is partial."""
+        client = self.MockFinnhubClient({
+            "2026-10-12": RuntimeError("Simulated API 500 error"),
+            "2026-10-13": [
+                {
+                    "id": 101,
+                    "datetime": int(pd.Timestamp("2026-10-13 14:00:00Z").timestamp()),
+                    "headline": "Apple Unveils M4 Chip Lineup",
+                    "summary": "Next generation M4 silicon.",
+                    "source": "TechWire",
+                    "url": "https://wire.example.com/m4",
+                }
+            ],
+        })
+        finnhub_df = fetch_finnhub_news("AAPL", "2026-10-12", "2026-10-13", client=client, retry_delay=0.0)
+        self.assertEqual(len(finnhub_df), 1)
+        self.assertEqual(finnhub_df.iloc[0]["headline"], "Apple Unveils M4 Chip Lineup")
+        self.assertEqual(finnhub_df.attrs["status"], STATUS_PARTIAL)
+        self.assertEqual(finnhub_df.attrs["failed_chunks"], [("2026-10-12", "2026-10-12")])
+        self.assertEqual(finnhub_df.attrs["successful_chunks"], [("2026-10-13", "2026-10-13")])
+        self.assertEqual(finnhub_df.attrs["total_chunks"], 2)
+
+        with patch("src.data_ingestion.news_sentiment.fetch_yahoo_fallback", return_value=pd.DataFrame()):
+            news_df = fetch_news(
+                "AAPL",
+                start_date="2026-10-12",
+                end_date="2026-10-13",
+                client=client,
+                retry_delay=0.0,
+            )
+            self.assertEqual(len(news_df), 1)
+            self.assertEqual(news_df.attrs["status"], STATUS_PARTIAL)
+            self.assertEqual(news_df.attrs["failed_chunks"], [("2026-10-12", "2026-10-12")])
+
+    def test_partial_retrieval_pipeline_preserves_historical_sentiment_on_unretrieved_dates(self) -> None:
+        """In partial retrieval, incremental merge updates only observed dates and preserves unretrieved historical dates."""
+        # 1. Establish historical sentiment on Day 0 (2026-10-12)
+        initial_sent = pd.DataFrame(
+            {
+                "sentiment_score": [0.85],
+                "sentiment_std": [0.08],
+                "sentiment_count": [4],
+                "prob_positive": [0.9],
+                "prob_negative": [0.05],
+                "prob_neutral": [0.05],
+            },
+            index=[self.dates[0]],
+        )
+        merge_sentiment_with_market_features(
+            market_features_path=self.market_file,
+            daily_sentiment_df=initial_sent,
+            output_path=self.market_file,
+            full_rebuild=True,
+        )
+
+        # 2. Run partial pipeline over 2026-10-12 to 2026-10-13 where Day 0 fails, Day 1 succeeds
+        client = self.MockFinnhubClient({
+            "2026-10-12": RuntimeError("500 Internal Server Error"),
+            "2026-10-13": [
+                {
+                    "id": 202,
+                    "datetime": int(pd.Timestamp("2026-10-13 14:00:00Z").timestamp()),
+                    "headline": "Apple Partners With Major Cloud Provider",
+                    "summary": "Cloud agreement signed.",
+                    "source": "MockNews",
+                    "url": "https://example.com/cloud",
+                }
+            ],
+        })
+
+        with patch("src.data_ingestion.news_sentiment.fetch_yahoo_fallback", return_value=pd.DataFrame()):
+            res = run_production_pipeline(
+                start_date="2026-10-12",
+                end_date="2026-10-13",
+                client=client,
+                market_features_path=self.market_file,
+                raw_news_path=self.raw_news_file,
+                processed_news_path=self.processed_news_file,
+                analyzer=self.MockAnalyzer(),
+                retry_delay=0.0,
+            )
+
+        self.assertEqual(res["status"], STATUS_PARTIAL)
+        self.assertEqual(res["raw_news_count"], 1)
+
+        # 3. Verify that Day 0 historical sentiment was NOT cleared or overwritten
+        market = pd.read_parquet(self.market_file)
+        self.assertEqual(market.loc[self.dates[0], "sentiment_coverage"], 1)
+        self.assertAlmostEqual(market.loc[self.dates[0], "sentiment_score"], 0.85)
+
+        # 4. Verify that Day 1 sentiment was updated
+        self.assertEqual(market.loc[self.dates[1], "sentiment_coverage"], 1)
+        self.assertAlmostEqual(market.loc[self.dates[1], "sentiment_score"], 0.5)
+
+        # Total coverage is 2 sessions
+        self.assertEqual(market["sentiment_coverage"].sum(), 2)
+
+    def test_total_retrieval_failure(self) -> None:
+        """All chunks fail -> status is failed and not silently treated as successful empty."""
+        client = self.MockFinnhubClient({
+            "2026-10-12": RuntimeError("Network Timeout"),
+            "2026-10-13": RuntimeError("Rate Limit 429"),
+        })
+        finnhub_df = fetch_finnhub_news("AAPL", "2026-10-12", "2026-10-13", client=client, retry_delay=0.0)
+        self.assertTrue(finnhub_df.empty)
+        self.assertEqual(finnhub_df.attrs["status"], STATUS_FAILED)
+        self.assertEqual(len(finnhub_df.attrs["failed_chunks"]), 2)
+        self.assertEqual(finnhub_df.attrs["total_chunks"], 2)
+
+        with patch("src.data_ingestion.news_sentiment.fetch_yahoo_fallback", return_value=pd.DataFrame()):
+            news_df = fetch_news(
+                "AAPL",
+                start_date="2026-10-12",
+                end_date="2026-10-13",
+                client=client,
+                retry_delay=0.0,
+            )
+            self.assertTrue(news_df.empty)
+            self.assertEqual(news_df.attrs["status"], STATUS_FAILED)
+            self.assertNotEqual(news_df.attrs["status"], STATUS_COMPLETE)
+
+    def test_total_retrieval_failure_pipeline_aborts_to_protect_historical_data(self) -> None:
+        """When Finnhub retrieval fails completely, pipeline aborts without touching historical sentiment."""
+        # 1. Establish historical sentiment on Day 0
+        initial_sent = pd.DataFrame(
+            {
+                "sentiment_score": [0.77],
+                "sentiment_std": [0.05],
+                "sentiment_count": [3],
+                "prob_positive": [0.8],
+                "prob_negative": [0.1],
+                "prob_neutral": [0.1],
+            },
+            index=[self.dates[0]],
+        )
+        merge_sentiment_with_market_features(
+            market_features_path=self.market_file,
+            daily_sentiment_df=initial_sent,
+            output_path=self.market_file,
+            full_rebuild=True,
+        )
+
+        # 2. Run pipeline with all chunks failing
+        client = self.MockFinnhubClient({
+            "2026-10-12": RuntimeError("Auth Failed 401"),
+            "2026-10-13": RuntimeError("Auth Failed 401"),
+        })
+
+        with patch("src.data_ingestion.news_sentiment.fetch_yahoo_fallback", return_value=pd.DataFrame()):
+            res = run_production_pipeline(
+                start_date="2026-10-12",
+                end_date="2026-10-13",
+                client=client,
+                market_features_path=self.market_file,
+                raw_news_path=self.raw_news_file,
+                processed_news_path=self.processed_news_file,
+                analyzer=self.MockAnalyzer(),
+                retry_delay=0.0,
+            )
+
+        self.assertEqual(res["status"], STATUS_FAILED)
+        self.assertFalse(self.raw_news_file.exists())
+
+        # 3. Market features must be completely untouched
+        market = pd.read_parquet(self.market_file)
+        self.assertEqual(market["sentiment_coverage"].sum(), 1)
+        self.assertAlmostEqual(market.loc[self.dates[0], "sentiment_score"], 0.77)
+
+    def test_failed_finnhub_with_fallback_news_aborts_to_prevent_wiping_historical_sentiment(self) -> None:
+        """Even if Yahoo fallback returns headlines, total Finnhub failure aborts pipeline to prevent clearing the refresh window."""
+        # 1. Establish historical sentiment on Day 0
+        initial_sent = pd.DataFrame(
+            {
+                "sentiment_score": [0.65],
+                "sentiment_std": [0.05],
+                "sentiment_count": [2],
+                "prob_positive": [0.7],
+                "prob_negative": [0.1],
+                "prob_neutral": [0.2],
+            },
+            index=[self.dates[0]],
+        )
+        merge_sentiment_with_market_features(
+            market_features_path=self.market_file,
+            daily_sentiment_df=initial_sent,
+            output_path=self.market_file,
+            full_rebuild=True,
+        )
+
+        # 2. Client fails all Finnhub chunks
+        client = self.MockFinnhubClient({
+            "2026-10-12": RuntimeError("Finnhub Unreachable"),
+            "2026-10-13": RuntimeError("Finnhub Unreachable"),
+        })
+
+        fallback_df = pd.DataFrame(
+            [
+                {
+                    "ticker": "AAPL",
+                    "published_at": pd.Timestamp("2026-10-13 14:00:00Z"),
+                    "headline": "Fallback headline from Yahoo",
+                    "summary": "Summary",
+                    "source": "Yahoo",
+                    "url": "https://yahoo.com/1",
+                    "provider": "yahoo_finance",
+                    "is_fallback": True,
+                    "raw_id": "y1",
+                }
+            ]
+        )
+
+        with patch("src.data_ingestion.news_sentiment.fetch_yahoo_fallback", return_value=fallback_df):
+            res = run_production_pipeline(
+                start_date="2026-10-12",
+                end_date="2026-10-13",
+                client=client,
+                market_features_path=self.market_file,
+                raw_news_path=self.raw_news_file,
+                processed_news_path=self.processed_news_file,
+                analyzer=self.MockAnalyzer(),
+                retry_delay=0.0,
+            )
+
+        # Status must be FAILED because primary Finnhub failed
+        self.assertEqual(res["status"], STATUS_FAILED)
+        # Market file must NOT have its Day 0 wiped out by fallback-only merge
+        market = pd.read_parquet(self.market_file)
+        self.assertEqual(market.loc[self.dates[0], "sentiment_coverage"], 1)
+        self.assertAlmostEqual(market.loc[self.dates[0], "sentiment_score"], 0.65)
 
 
 if __name__ == "__main__":

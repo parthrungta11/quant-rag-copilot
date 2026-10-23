@@ -57,6 +57,22 @@ MARKET_FEATURES_FILE = PROCESSED_DATA_DIR / "market_features.parquet"
 
 FINBERT_MODEL_NAME = "ProsusAI/finbert"
 
+STATUS_COMPLETE = "complete"
+STATUS_PARTIAL = "partial"
+STATUS_FAILED = "failed"
+
+NEWS_COLUMNS = [
+    "ticker",
+    "published_at",
+    "headline",
+    "summary",
+    "source",
+    "url",
+    "provider",
+    "is_fallback",
+    "raw_id",
+]
+
 
 def load_api_key() -> str | None:
     """Load Finnhub API key from project root .env without logging secret values."""
@@ -376,11 +392,17 @@ def fetch_finnhub_news(
     end_date: str,
     client: finnhub.Client | None = None,
     chunk_days: int = 1,
+    retry_delay: float = 1.0,
 ) -> pd.DataFrame:
     """Fetch company news from Finnhub in chunked date intervals with rate-limit handling.
 
     Uses short date chunks (default 1 calendar day per request) to prevent truncation.
     Finnhub silently truncates responses at ~245-250 items sorted newest-first.
+
+    Distinguishes three collection outcomes via df.attrs["status"]:
+    - complete: All requested chunks were retrieved successfully (even if 0 articles).
+    - partial: Some chunks failed, but >= 1 chunk succeeded; returns articles from successful chunks.
+    - failed: All requested chunks failed after retries.
     """
     if client is None:
         client = get_finnhub_client()
@@ -393,6 +415,7 @@ def fetch_finnhub_news(
     articles: list[dict[str, Any]] = []
     chunks = generate_date_chunks(start_dt, end_dt, chunk_days=chunk_days)
     failed_chunks: list[tuple[str, str]] = []
+    successful_chunks: list[tuple[str, str]] = []
 
     logger.info(
         f"Querying Finnhub for {ticker} across {len(chunks)} chunk(s) "
@@ -416,7 +439,8 @@ def fetch_finnhub_news(
                     f"Finnhub request failed (attempt {attempt + 1}/{retries}) "
                     f"for [{from_str} to {to_str}]: {type(exc).__name__} ({clean_err})"
                 )
-                time.sleep(1.0 * (attempt + 1))
+                if retry_delay > 0:
+                    time.sleep(retry_delay * (attempt + 1))
 
         if not success:
             failed_chunks.append((from_str, to_str))
@@ -424,6 +448,8 @@ def fetch_finnhub_news(
                 f"Failed to fetch Finnhub news for window [{from_str} to {to_str}] after {retries} retries."
             )
             continue
+
+        successful_chunks.append((from_str, to_str))
 
         chunk_timestamps: list[pd.Timestamp] = []
         for item in batch_items:
@@ -470,15 +496,45 @@ def fetch_finnhub_news(
                 "which is near Finnhub's response cap (~250). Earlier headlines in this window may be truncated."
             )
 
-        time.sleep(0.15)
+        if retry_delay > 0:
+            time.sleep(0.15)
 
-    if failed_chunks:
-        logger.error(f"Finnhub collection completed with {len(failed_chunks)} failed chunk(s): {failed_chunks}")
+    total_chunks = len(chunks)
+    failed_count = len(failed_chunks)
+    success_count = len(successful_chunks)
+
+    if total_chunks > 0 and success_count == 0:
+        status = STATUS_FAILED
+    elif failed_count > 0:
+        status = STATUS_PARTIAL
+    else:
+        status = STATUS_COMPLETE
+
+    if status == STATUS_FAILED:
+        logger.error(
+            f"Finnhub news collection failed: all {total_chunks} chunk(s) failed."
+        )
+    elif status == STATUS_PARTIAL:
+        logger.warning(
+            f"Finnhub news collection completed with {failed_count}/{total_chunks} failed chunk(s): {failed_chunks}. "
+            f"Retained {len(articles)} articles from {success_count} successful chunk(s)."
+        )
+    else:
+        logger.info(
+            f"Finnhub news collection complete across all {total_chunks} chunk(s)."
+        )
 
     if not articles:
-        return pd.DataFrame()
+        df = pd.DataFrame(columns=NEWS_COLUMNS)
+    else:
+        df = pd.DataFrame(articles)
 
-    return pd.DataFrame(articles)
+    df.attrs["status"] = status
+    df.attrs["failed_chunks"] = failed_chunks
+    df.attrs["successful_chunks"] = successful_chunks
+    df.attrs["total_chunks"] = total_chunks
+
+    return df
 
 
 def fetch_yahoo_fallback(
@@ -554,13 +610,23 @@ def fetch_news(
     include_fallback_supplement: bool = True,
     client: finnhub.Client | None = None,
     chunk_days: int = 1,
+    retry_delay: float = 1.0,
 ) -> pd.DataFrame:
     """Fetch news from Finnhub (primary) and Yahoo Finance (fallback).
 
     Ensures duplicate articles are dropped while prioritizing primary Finnhub records,
     and strictly enforces date range filtering on the combined, deduplicated dataset.
+
+    Exposes retrieval metadata via df.attrs["status"]:
+    - complete: Finnhub retrieved all requested chunks successfully (even if 0 articles).
+    - partial: Finnhub had some failed chunks but preserved articles from successful chunks.
+    - failed: Finnhub failed across all chunks.
     """
     frames: list[pd.DataFrame] = []
+    finnhub_status = "not_attempted" if use_fallback_only else STATUS_FAILED
+    failed_chunks: list[tuple[str, str]] = []
+    successful_chunks: list[tuple[str, str]] = []
+    total_chunks: int = 0
 
     if not use_fallback_only:
         try:
@@ -570,13 +636,33 @@ def fetch_news(
                 end_date=end_date,
                 client=client,
                 chunk_days=chunk_days,
+                retry_delay=retry_delay,
             )
-            if not finnhub_df.empty:
-                frames.append(finnhub_df)
-                logger.info(f"Retrieved {len(finnhub_df)} articles from Finnhub.")
-            else:
-                logger.warning("Finnhub returned no articles. Triggering Yahoo fallback.")
+            finnhub_status = finnhub_df.attrs.get("status", STATUS_COMPLETE)
+            failed_chunks = finnhub_df.attrs.get("failed_chunks", [])
+            successful_chunks = finnhub_df.attrs.get("successful_chunks", [])
+            total_chunks = finnhub_df.attrs.get("total_chunks", 0)
+
+            if finnhub_status == STATUS_COMPLETE:
+                if not finnhub_df.empty:
+                    frames.append(finnhub_df)
+                    logger.info(f"Retrieved {len(finnhub_df)} articles from Finnhub (complete).")
+                else:
+                    logger.info("Finnhub returned 0 articles (collection complete across all chunks).")
+            elif finnhub_status == STATUS_PARTIAL:
+                if not finnhub_df.empty:
+                    frames.append(finnhub_df)
+                logger.warning(
+                    f"Finnhub retrieval partial: {len(failed_chunks)}/{total_chunks} chunks failed. "
+                    f"Preserved {len(finnhub_df)} articles from successful chunks."
+                )
+            elif finnhub_status == STATUS_FAILED:
+                logger.error(
+                    f"Finnhub retrieval failed across all {total_chunks} chunk(s). "
+                    "Triggering Yahoo fallback."
+                )
         except Exception as exc:
+            finnhub_status = STATUS_FAILED
             logger.error(f"Error fetching primary Finnhub news: {exc}. Falling back to Yahoo Finance.")
 
     # Fetch Yahoo Finance fallback if requested or if primary failed
@@ -596,26 +682,20 @@ def fetch_news(
 
     if not frames:
         logger.warning("No news collected from either Finnhub or Yahoo Finance.")
-        return pd.DataFrame(
-            columns=[
-                "ticker",
-                "published_at",
-                "headline",
-                "summary",
-                "source",
-                "url",
-                "provider",
-                "is_fallback",
-                "raw_id",
-            ]
-        )
+        result_df = pd.DataFrame(columns=NEWS_COLUMNS)
+    else:
+        combined = pd.concat(frames, ignore_index=True)
+        deduped = deduplicate_articles(combined)
+        result_df = filter_news_by_date_range(deduped, start_date=start_date, end_date=end_date)
+        logger.info(f"Total deduplicated and date-filtered news articles: {len(result_df)}")
 
-    combined = pd.concat(frames, ignore_index=True)
-    deduped = deduplicate_articles(combined)
-    filtered = filter_news_by_date_range(deduped, start_date=start_date, end_date=end_date)
+    result_df.attrs["status"] = finnhub_status
+    result_df.attrs["finnhub_status"] = finnhub_status
+    result_df.attrs["failed_chunks"] = failed_chunks
+    result_df.attrs["successful_chunks"] = successful_chunks
+    result_df.attrs["total_chunks"] = total_chunks
 
-    logger.info(f"Total deduplicated and date-filtered news articles: {len(filtered)}")
-    return filtered
+    return result_df
 
 
 class FinBERTSentimentAnalyzer:
@@ -920,7 +1000,7 @@ def run_test_mode(ticker: str = "AAPL") -> None:
     print("=" * 70)
 
     # 1. Test chunk boundaries and single-day chunks
-    print("[1/6] Testing chunk boundaries and single-day chunk generation...")
+    print("[1/7] Testing chunk boundaries and single-day chunk generation...")
     oct_chunks = generate_date_chunks(dt.date(2026, 10, 2), dt.date(2026, 10, 13), chunk_days=1)
     assert len(oct_chunks) == 12, f"Expected 12 single-day chunks, got {len(oct_chunks)}"
     assert oct_chunks[0] == ("2026-10-02", "2026-10-02")
@@ -928,7 +1008,7 @@ def run_test_mode(ticker: str = "AAPL") -> None:
     print(f"  [OK] Single-day chunking verified: {len(oct_chunks)} chunks without gaps.")
 
     # 2. Test multi-tier article deduplication (Finnhub over Yahoo precedence)
-    print("[2/6] Testing multi-tier article deduplication across chunks...")
+    print("[2/7] Testing multi-tier article deduplication across chunks...")
     test_dup_df = pd.DataFrame(
         [
             {
@@ -1010,7 +1090,7 @@ def run_test_mode(ticker: str = "AAPL") -> None:
     print(f"  [OK] Multi-tier deduplication verified: 7 raw articles -> {len(deduped_test)} unique articles (Finnhub prioritized).")
 
     # 3. Test date range filtering in America/New_York
-    print("[3/6] Testing date range filtering with timezone boundaries...")
+    print("[3/7] Testing date range filtering with timezone boundaries...")
     sample_dates_df = pd.DataFrame(
         [
             # Exactly on start date in ET
@@ -1042,7 +1122,7 @@ def run_test_mode(ticker: str = "AAPL") -> None:
     print(f"  [OK] Date range filtering verified ({len(sample_dates_df)} -> {len(filtered)} retained).")
 
     # 4. Trading session assignment and look-ahead bias prevention
-    print("[4/6] Testing trading session assignment, early closes, and holidays...")
+    print("[4/7] Testing trading session assignment, early closes, and holidays...")
     equity_holidays = get_us_equity_market_holidays()
 
     edge_cases = [
@@ -1065,7 +1145,7 @@ def run_test_mode(ticker: str = "AAPL") -> None:
         print(f"  [OK] {label} -> {res.date()}")
 
     # 5. Offline sentiment scoring & daily aggregation with mock analyzer
-    print("[5/6] Testing sentiment scoring pipeline & aggregation (offline mock)...")
+    print("[5/7] Testing sentiment scoring pipeline & aggregation (offline mock)...")
     class MockSentimentAnalyzer:
         def analyze_batch(self, headlines: list[str], batch_size: int = 32) -> pd.DataFrame:
             return pd.DataFrame(
@@ -1120,7 +1200,7 @@ def run_test_mode(ticker: str = "AAPL") -> None:
     print("  [OK] Daily sentiment aggregated successfully.")
 
     # 6. Incremental vs Full Rebuild merge & invariants
-    print("[6/6] Testing incremental merge, full rebuild, idempotence, and invariants...")
+    print("[6/7] Testing incremental merge, full rebuild, idempotence, and invariants...")
     # Synthetic market DataFrame (5 trading days)
     dates = pd.date_range("2026-10-12", periods=5, freq="B")
     base_market = pd.DataFrame(
@@ -1222,6 +1302,63 @@ def run_test_mode(ticker: str = "AAPL") -> None:
         assert missing_rows["prob_negative"].isna().all()
         print("  [OK] Invariant verified: Missing sentiment is strictly NaN, never imputed with 0.0.")
 
+        # 7. Complete empty retrieval, partial chunk failure, and total failure distinction
+        print("[7/7] Testing Finnhub collection outcomes (complete empty, partial, failed)...")
+        class MockFinnhubClient:
+            def __init__(self, behaviors: dict[str, Any]) -> None:
+                self.behaviors = behaviors
+
+            def company_news(self, ticker: str, _from: str, to: str) -> list[dict[str, Any]]:
+                val = self.behaviors.get((_from, to)) or self.behaviors.get(_from)
+                if isinstance(val, Exception):
+                    raise val
+                return val or []
+
+        # 7a. Complete empty retrieval
+        complete_client = MockFinnhubClient({
+            "2026-10-10": [],
+            "2026-10-11": [],
+        })
+        res_complete = fetch_finnhub_news("AAPL", "2026-10-10", "2026-10-11", client=complete_client, retry_delay=0.0)
+        assert res_complete.empty, "Expected empty DataFrame for complete 0-article retrieval"
+        assert res_complete.attrs["status"] == STATUS_COMPLETE
+        assert res_complete.attrs["failed_chunks"] == []
+        assert res_complete.attrs["total_chunks"] == 2
+        print("  [OK] Complete empty retrieval correctly identified.")
+
+        # 7b. Partial chunk failure
+        partial_client = MockFinnhubClient({
+            "2026-10-10": RuntimeError("Simulated API 500"),
+            "2026-10-11": [
+                {
+                    "id": 999,
+                    "datetime": int(pd.Timestamp("2026-10-11 12:00:00Z").timestamp()),
+                    "headline": "Apple Launches Service Update",
+                    "summary": "Service update details.",
+                    "source": "WireA",
+                    "url": "https://example.com/art999",
+                }
+            ],
+        })
+        res_partial = fetch_finnhub_news("AAPL", "2026-10-10", "2026-10-11", client=partial_client, retry_delay=0.0)
+        assert len(res_partial) == 1, "Expected successful chunk article to be preserved"
+        assert res_partial.attrs["status"] == STATUS_PARTIAL
+        assert len(res_partial.attrs["failed_chunks"]) == 1
+        assert res_partial.attrs["failed_chunks"][0] == ("2026-10-10", "2026-10-10")
+        assert len(res_partial.attrs["successful_chunks"]) == 1
+        print("  [OK] Partial chunk failure correctly identified and successful articles preserved.")
+
+        # 7c. Total failure
+        failed_client = MockFinnhubClient({
+            "2026-10-10": RuntimeError("Simulated API 500"),
+            "2026-10-11": RuntimeError("Simulated Rate Limit"),
+        })
+        res_failed = fetch_finnhub_news("AAPL", "2026-10-10", "2026-10-11", client=failed_client, retry_delay=0.0)
+        assert res_failed.empty
+        assert res_failed.attrs["status"] == STATUS_FAILED
+        assert len(res_failed.attrs["failed_chunks"]) == 2
+        print("  [OK] Total retrieval failure correctly identified (not treated as successful empty).")
+
     finally:
         if temp_market_path.exists():
             temp_market_path.unlink()
@@ -1238,13 +1375,30 @@ def run_production_pipeline(
     chunk_days: int = 1,
     full_rebuild: bool = False,
     batch_size: int = 32,
-) -> None:
-    """Execute news ingestion, FinBERT scoring, and market features merge."""
+    client: finnhub.Client | None = None,
+    market_features_path: Path | None = None,
+    raw_news_path: Path | None = None,
+    processed_news_path: Path | None = None,
+    analyzer: Any = None,
+    retry_delay: float = 1.0,
+) -> dict[str, Any]:
+    """Execute news ingestion, FinBERT scoring, and market features merge.
+
+    Safely distinguishes:
+    1. Complete: All chunks succeeded. If 0 articles, confirmed empty without modifying features.
+    2. Partial: Some chunks failed; preserves articles from successful chunks, and restricts
+       incremental update strictly to observed dates to prevent wiping unretrieved dates.
+    3. Failed: All chunks failed; aborts pipeline to prevent clearing/overwriting historical data.
+    """
     if end_date is None:
         end_date = dt.date.today().strftime("%Y-%m-%d")
 
-    RAW_DATA_DIR.mkdir(parents=True, exist_ok=True)
-    PROCESSED_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    raw_file = raw_news_path or RAW_NEWS_FILE
+    proc_file = processed_news_path or PROCESSED_NEWS_FILE
+    market_file = market_features_path or MARKET_FEATURES_FILE
+
+    raw_file.parent.mkdir(parents=True, exist_ok=True)
+    proc_file.parent.mkdir(parents=True, exist_ok=True)
 
     # 1. Ingest raw news
     raw_news = fetch_news(
@@ -1253,43 +1407,86 @@ def run_production_pipeline(
         end_date=end_date,
         include_fallback_supplement=True,
         chunk_days=chunk_days,
+        client=client,
+        retry_delay=retry_delay,
     )
 
-    if raw_news.empty:
-        logger.error("No news articles collected. Exiting pipeline.")
-        return
+    fetch_status = raw_news.attrs.get("status", STATUS_COMPLETE)
 
-    raw_news.to_parquet(RAW_NEWS_FILE)
-    logger.info(f"Saved {len(raw_news)} raw news articles to {RAW_NEWS_FILE}")
+    if fetch_status == STATUS_FAILED:
+        logger.error(
+            f"Finnhub news retrieval failed completely for {ticker} [{start_date} to {end_date}]. "
+            "Aborting pipeline to avoid overwriting or clearing historical sentiment."
+        )
+        return {"status": STATUS_FAILED, "raw_news_count": len(raw_news), "processed_count": 0, "covered_sessions": 0}
+
+    if raw_news.empty:
+        if fetch_status == STATUS_COMPLETE:
+            logger.info(
+                f"News retrieval complete for {ticker} [{start_date} to {end_date}]: "
+                "confirmed zero articles published. Exiting pipeline."
+            )
+        elif fetch_status == STATUS_PARTIAL:
+            logger.warning(
+                f"News retrieval was partial for {ticker} [{start_date} to {end_date}] "
+                "and returned zero articles. Exiting without modifying market features."
+            )
+        else:
+            logger.error("No news articles collected. Exiting pipeline.")
+        return {"status": fetch_status, "raw_news_count": 0, "processed_count": 0, "covered_sessions": 0}
+
+    raw_news.to_parquet(raw_file)
+    logger.info(f"Saved {len(raw_news)} raw news articles to {raw_file}")
 
     # 2. Process sentiment with FinBERT and assign look-ahead-bias-free trading dates
     processed_news = process_news_sentiment(
         raw_news_df=raw_news,
         batch_size=batch_size,
+        analyzer=analyzer,
     )
-    processed_news.to_parquet(PROCESSED_NEWS_FILE)
-    logger.info(f"Saved {len(processed_news)} processed news sentiment records to {PROCESSED_NEWS_FILE}")
+    processed_news.to_parquet(proc_file)
+    logger.info(f"Saved {len(processed_news)} processed news sentiment records to {proc_file}")
 
     # 3. Aggregate daily sentiment by trading session
     daily_sentiment = aggregate_daily_sentiment(processed_news)
 
     # 4. Merge daily sentiment into market_features.parquet
-    if MARKET_FEATURES_FILE.exists():
+    covered_sessions = 0
+    if market_file.exists():
+        # When collection is partial, restrict incremental refresh strictly to observed trading dates
+        # so historical sentiment on unretrieved/failed dates is preserved.
+        refresh_start = None if fetch_status == STATUS_PARTIAL else start_date
+        refresh_end = None if fetch_status == STATUS_PARTIAL else end_date
+
+        if fetch_status == STATUS_PARTIAL:
+            logger.warning(
+                "Finnhub collection was partial. Updating only trading sessions with retrieved news "
+                "to preserve historical sentiment for failed chunk windows."
+            )
+
         merged = merge_sentiment_with_market_features(
-            market_features_path=MARKET_FEATURES_FILE,
+            market_features_path=market_file,
             daily_sentiment_df=daily_sentiment,
-            output_path=MARKET_FEATURES_FILE,
-            refresh_start_date=start_date,
-            refresh_end_date=end_date,
+            output_path=market_file,
+            refresh_start_date=refresh_start,
+            refresh_end_date=refresh_end,
             full_rebuild=full_rebuild,
         )
+        covered_sessions = int(merged["sentiment_coverage"].sum())
         print("\nPipeline execution complete.")
         print(f"Market features rows: {len(merged)}")
-        print(f"Trading days with sentiment coverage: {merged['sentiment_coverage'].sum()}")
+        print(f"Trading days with sentiment coverage: {covered_sessions}")
     else:
         logger.warning(
-            f"Market features file {MARKET_FEATURES_FILE} not found. Skipping merge."
+            f"Market features file {market_file} not found. Skipping merge."
         )
+
+    return {
+        "status": fetch_status,
+        "raw_news_count": len(raw_news),
+        "processed_count": len(processed_news),
+        "covered_sessions": covered_sessions,
+    }
 
 
 def main() -> None:
