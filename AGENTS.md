@@ -66,7 +66,9 @@ quant-rag-copilot/
 - **Safe Incremental Updates vs Full Rebuild**:
   - Incremental update (`full_rebuild=False`, default): Preserves historical sentiment for all market dates outside the specified refresh window `[refresh_start_date, refresh_end_date]`. Empty retrieval does NOT erase historical data.
   - Full rebuild (`full_rebuild=True`, `--full-rebuild`): Deliberately clears and replaces sentiment columns across the entire market dataset.
-  - Missing Sentiment Invariant: Sessions lacking news coverage (417 of 451 sessions) have `sentiment_coverage = 0` and strictly retain `NaN` for all sentiment metrics (never imputed with `0.0`).
+  - Missing Sentiment Invariant: Sessions lacking news coverage strictly retain `NaN` for all sentiment metrics (never imputed with `0.0`) with `sentiment_coverage = 0`.
+    - **Canonical Active State (40-Session Dataset)**: **411 of 451 sessions** lack coverage (`40` covered: `2026-08-12` to `2026-08-19` and `2026-09-01` to `2026-10-19`). See [docs/DATA_POLICY.md](docs/DATA_POLICY.md).
+    - **Frozen Historical Baseline (34-Session Dataset)**: **417 of 451 sessions** lacked coverage (`34` covered: `2026-09-01` to `2026-10-19`), preserved in `data/backups/pre_august_trial/` and `reports/baseline_validation_metrics.json`.
 
 ### Stage 4: Baseline Forecasting & Walk-Forward Validation (`src/models/baseline_forecasting.py`)
 - **Stationary Feature Transformations** (`src/features/feature_transforms.py`):
@@ -88,7 +90,9 @@ quant-rag-copilot/
   - `Ridge Hybrid`: Ridge regression with training-fold-only `0.0` neutral imputation + explicit `sentiment_coverage` indicator.
   - `HGB Hybrid`: `HistGradientBoostingRegressor` on technical + sentiment features using native `NaN` routing.
 - **Controlled Sub-Period Ablation**:
-  - Technical-only and Hybrid models are evaluated on the exact same 33 news-covered sessions (2026-09-01 to 2026-10-16) to isolate the incremental value of sentiment.
+  - Technical-only and Hybrid models are evaluated on the exact same news-covered sessions with realized targets to isolate the incremental value of sentiment.
+  - **Frozen Baseline (`reports/baseline_validation_metrics.json`, 34-session state)**: Evaluated on **33 news-covered sessions** (`2026-09-01` to `2026-10-16`).
+  - **Canonical Active State (40-session state)**: Contains **39 realized news-covered sessions** (`2026-08-12` to `2026-08-19` and `2026-09-01` to `2026-10-16`, excluding unrealized `2026-10-19`). Note that `forecast_predictions.parquet` and `baseline_validation_metrics.json` remain frozen at the 34-session baseline per [docs/DATA_POLICY.md](docs/DATA_POLICY.md).
 
 ---
 
@@ -129,10 +133,10 @@ quant-rag-copilot/
    - `Ridge Tech` achieves the highest directional accuracy ($51.2\%$) across the 250-session test period, with $R^2_{\text{vs\_zero}} = -0.0121$ and $R^2_{\text{descriptive}} = -0.0185$, typical for unconstrained linear return forecasts without cross-asset features.
 3. **Sentiment Sample Size Limitation & Tree Split Audit**:
    - Direct node-by-node inspection of all 251 fitted `HistGradientBoostingRegressor` models confirmed that **0 sentiment features were selected for splits across any training fold**.
-   - An in-depth audit isolated two structural causes:
-     a) For folds $t=200$ to $416$ (217 folds, 86.5% of the evaluation), the training window contained zero sentiment records, causing all sentiment features to be dropped prior to fitting (`nunique < 2`).
-     b) For folds $t=417$ to $450$ (34 folds), non-null sentiment was present in only 0.7% to 7.3% of training samples (3 to 33 out of 420–450 samples). Under `min_samples_leaf=10` and L2 regularization, partitioning 400+ samples on a 93%+ NaN feature produces negligible loss reduction compared to continuous, 100% dense technical indicators.
-   - **Controlled Experiment**: When HGB was trained exclusively on the 33 sentiment-covered sessions with dense observations, HGB actively split on `sentiment_score` and `sentiment_std`, confirming that 0 splits in walk-forward validation is a mathematical consequence of extreme sparsity diluted over dense technical history, not an inability of tree architectures to process sentiment.
+   - An in-depth audit isolated two structural causes (documented for the **frozen 34-session baseline**, with equivalent sparsity in the **canonical 40-session active state**):
+     a) **Frozen 34-Session Baseline**: For folds $t=200$ to $416$ (217 folds, 86.5% of the evaluation), the training window contained zero sentiment records (`nunique < 2`). In the **canonical 40-session active state**, sentiment begins at index $t=403$ (`2026-08-12`), so folds $t=200$ to $403$ (204 folds, 81.3% of the evaluation) contain zero sentiment in the training window $[0, t-1]$.
+     b) **Frozen 34-Session Baseline**: For folds $t=417$ to $450$ (34 folds), non-null sentiment was present in only 0.7% to 7.3% of training samples (3 to 33 out of 420–450 samples). In the **canonical 40-session active state**, folds $t=404$ to $450$ (47 training folds covering up to 39–40 covered sessions) still exhibit $>91\%$ missingness (0.2% to 8.9% coverage). Under `min_samples_leaf=10` and L2 regularization, partitioning 400+ samples on a $>91\%$ NaN feature produces negligible loss reduction compared to continuous, 100% dense technical indicators.
+   - **Controlled Experiment (34-Session Baseline)**: When HGB was trained exclusively on the 33 sentiment-covered sessions with dense observations, HGB actively split on `sentiment_score` and `sentiment_std`, confirming that 0 splits in walk-forward validation is a mathematical consequence of extreme sparsity diluted over dense technical history, not an inability of tree architectures to process sentiment.
 4. **Exploratory Strategy Assumptions & Caveats**:
    - The sign-based trading metrics are strictly exploratory theoretical proxies and must **not** be presented as realizable trading performance.
    - Position mapping: $\hat{R} > 0 \rightarrow +1$ (long), $\hat{R} < 0 \rightarrow -1$ (short), $\hat{R} = 0 \rightarrow 0$ (cash/neutral). The zero-return baseline holds cash with 0.0 cumulative return and 0.0 Sharpe.

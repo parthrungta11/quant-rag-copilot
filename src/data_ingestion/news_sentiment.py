@@ -13,9 +13,14 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
+import json
 import logging
 import os
+import re
+import shutil
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Any, Iterable
@@ -60,6 +65,29 @@ FINBERT_MODEL_NAME = "ProsusAI/finbert"
 STATUS_COMPLETE = "complete"
 STATUS_PARTIAL = "partial"
 STATUS_FAILED = "failed"
+
+DEFAULT_STAGED_CHUNKS_DIR = PROJECT_ROOT / "data" / "raw" / "staged_chunks"
+DEFAULT_MANIFEST_PATH = PROJECT_ROOT / "data" / "raw" / "news_retrieval_manifest.json"
+DEFAULT_TRANSACTION_JOURNAL = PROJECT_ROOT / "data" / "backups" / "transaction_journal.json"
+
+TX_STATE_STAGED = "STAGED"
+TX_STATE_RECOVERING = "RECOVERING"
+TX_STATE_COMMITTED = "COMMITTED"
+TX_STATE_ABORTED_RECOVERED = "ABORTED_RECOVERED"
+
+# Authorized directory roots for production safety (rejecting whole-PROJECT_ROOT traversal)
+DEFAULT_ALLOWED_DATA_ROOTS = [
+    PROJECT_ROOT / "data" / "raw",
+    PROJECT_ROOT / "data" / "processed",
+]
+DEFAULT_ALLOWED_BACKUP_ROOTS = [
+    PROJECT_ROOT / "data" / "backups",
+]
+DEFAULT_ALLOWED_JOURNAL_ROOTS = [
+    PROJECT_ROOT / "data" / "backups",
+]
+
+HEX_64_PATTERN = re.compile(r"^[0-9a-fA-F]{64}$")
 
 NEWS_COLUMNS = [
     "ticker",
@@ -353,37 +381,762 @@ def generate_date_chunks(
 
 
 def deduplicate_articles(df: pd.DataFrame) -> pd.DataFrame:
-    """Deduplicate news articles across chunks using stable IDs, URLs, and normalized headlines."""
+    """Deduplicate news articles across chunks using stable IDs, URLs, and normalized headlines.
+
+    Deterministic tie-breaking:
+    Equal publication timestamps are deterministically sorted by raw_id, then URL, then headline,
+    ensuring identical row ordering regardless of input concatenation permutations while strictly
+    preserving primary Finnhub precedence (is_fallback=False precedes is_fallback=True).
+    """
     if df.empty:
         return df
 
     working = df.copy()
     working["published_at"] = pd.to_datetime(working["published_at"], utc=True)
-    # Sort so primary Finnhub records (is_fallback=False) come before fallback records
+
+    # Deterministic helper keys for stable tie-breaking
+    working["_raw_id_clean"] = working["raw_id"].fillna("").astype(str).str.strip()
+    working["_url_clean"] = working["url"].fillna("").astype(str).str.strip()
+    working["_headline_clean"] = working["headline"].fillna("").astype(str).str.lower().str.strip()
+
+    # Sort so primary Finnhub records (is_fallback=False) come before fallback records,
+    # with deterministic tie-breaking for equal publication timestamps.
     working = working.sort_values(
-        by=["is_fallback", "published_at"],
-        ascending=[True, False],
+        by=["is_fallback", "published_at", "_raw_id_clean", "_url_clean", "_headline_clean"],
+        ascending=[True, False, True, True, True],
     )
 
     # 1. Deduplicate by stable non-empty raw_id (Finnhub article ID or Yahoo UUID)
-    has_id = working["raw_id"].fillna("").astype(str).str.strip().ne("")
-    with_id = working[has_id].drop_duplicates(subset=["raw_id"], keep="first")
+    has_id = working["_raw_id_clean"].ne("")
+    with_id = working[has_id].drop_duplicates(subset=["_raw_id_clean"], keep="first")
     without_id = working[~has_id]
     combined = pd.concat([with_id, without_id], ignore_index=True)
 
     # 2. Deduplicate by non-empty URL
-    combined["_url_clean"] = combined["url"].fillna("").astype(str).str.strip()
     has_url = combined["_url_clean"].ne("")
     with_url = combined[has_url].drop_duplicates(subset=["_url_clean"], keep="first")
     without_url = combined[~has_url]
     combined = pd.concat([with_url, without_url], ignore_index=True)
 
     # 3. Deduplicate by normalized lowercase headline and published timestamp
-    combined["_headline_clean"] = combined["headline"].astype(str).str.lower().str.strip()
     deduped = combined.drop_duplicates(subset=["_headline_clean", "published_at"], keep="first")
 
-    deduped = deduped.drop(columns=["_url_clean", "_headline_clean"], errors="ignore")
-    return deduped.sort_values(by="published_at", ascending=False).reset_index(drop=True)
+    # Final deterministic sort: newest first, with deterministic tie-breaker on ID/URL/headline
+    deduped = deduped.sort_values(
+        by=["published_at", "_raw_id_clean", "_url_clean", "_headline_clean"],
+        ascending=[False, True, True, True],
+    ).reset_index(drop=True)
+
+    deduped = deduped.drop(columns=["_raw_id_clean", "_url_clean", "_headline_clean"], errors="ignore")
+    return deduped
+
+
+def merge_raw_news_archive(
+    existing_raw_path: Path,
+    incoming_raw_df: pd.DataFrame,
+    output_path: Path | None = None,
+) -> pd.DataFrame:
+    """Safely combine incoming raw news with existing raw archive, preserving all original records.
+
+    Idempotent no-op:
+    If incoming_raw_df contains zero net-new articles, returns existing_df directly without
+    re-concatenating or re-sorting, preventing unnecessary Parquet byte mutations.
+    """
+    if not existing_raw_path.exists():
+        merged = deduplicate_articles(incoming_raw_df) if not incoming_raw_df.empty else incoming_raw_df
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            merged.to_parquet(output_path)
+        return merged
+
+    if incoming_raw_df.empty:
+        existing_df = pd.read_parquet(existing_raw_path)
+        if output_path is not None and output_path.resolve() != existing_raw_path.resolve():
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(existing_raw_path, output_path)
+        return existing_df
+
+    existing_df = pd.read_parquet(existing_raw_path)
+    net_new = get_net_new_articles(incoming_raw_df, existing_df)
+    if net_new.empty:
+        logger.info("Zero net-new articles detected for raw news archive. Preserving existing archive without modification.")
+        if output_path is not None and output_path.resolve() != existing_raw_path.resolve():
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(existing_raw_path, output_path)
+        return existing_df
+
+    combined = pd.concat([existing_df, incoming_raw_df], ignore_index=True)
+    merged = deduplicate_articles(combined)
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        merged.to_parquet(output_path)
+    return merged
+
+
+def merge_processed_news_archive(
+    existing_processed_path: Path,
+    incoming_processed_df: pd.DataFrame,
+    output_path: Path | None = None,
+) -> pd.DataFrame:
+    """Safely combine incoming processed news with existing processed archive, preserving all original records.
+
+    Idempotent no-op:
+    If incoming_processed_df contains zero net-new articles, returns existing_df directly without
+    re-concatenating or re-sorting, preventing unnecessary Parquet byte mutations.
+    """
+    if not existing_processed_path.exists():
+        merged = deduplicate_articles(incoming_processed_df) if not incoming_processed_df.empty else incoming_processed_df
+        if output_path is not None:
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            merged.to_parquet(output_path)
+        return merged
+
+    if incoming_processed_df.empty:
+        existing_df = pd.read_parquet(existing_processed_path)
+        if output_path is not None and output_path.resolve() != existing_processed_path.resolve():
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(existing_processed_path, output_path)
+        return existing_df
+
+    existing_df = pd.read_parquet(existing_processed_path)
+    net_new = get_net_new_articles(incoming_processed_df, existing_df)
+    if net_new.empty:
+        logger.info("Zero net-new articles detected for processed news archive. Preserving existing archive without modification.")
+        if output_path is not None and output_path.resolve() != existing_processed_path.resolve():
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(existing_processed_path, output_path)
+        return existing_df
+
+    combined = pd.concat([existing_df, incoming_processed_df], ignore_index=True)
+    merged = deduplicate_articles(combined)
+    if output_path is not None:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        merged.to_parquet(output_path)
+    return merged
+
+
+def compute_sha256(file_path: Path) -> str:
+    """Compute SHA-256 checksum of a file."""
+    h = hashlib.sha256()
+    with open(file_path, "rb") as f:
+        while chunk := f.read(65536):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def durable_json_write(file_path: Path, data: dict[str, Any]) -> None:
+    """Atomically write JSON data to file with fsync to guarantee durability."""
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = file_path.with_suffix(file_path.suffix + ".tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(data, f, indent=2)
+        f.flush()
+        os.fsync(f.fileno())
+    tmp_path.replace(file_path)
+
+
+def is_safe_contained_path(path: Path, allowed_roots: list[Path]) -> bool:
+    """Check if resolved path is strictly contained within any of allowed_roots without symlink escapes."""
+    try:
+        resolved = path.resolve(strict=False)
+    except Exception:
+        return False
+
+    for root in allowed_roots:
+        resolved_root = root.resolve()
+        try:
+            if hasattr(resolved, "is_relative_to"):
+                if resolved.is_relative_to(resolved_root):
+                    return True
+            else:
+                resolved.relative_to(resolved_root)
+                return True
+        except (ValueError, TypeError):
+            continue
+    return False
+
+
+def check_no_symlinks(path: Path) -> None:
+    """Reject symlinks in the path or any of its parent directory components."""
+    curr = path
+    while curr != curr.parent:
+        if curr.is_symlink():
+            raise RuntimeError(f"FATAL: Symlinks prohibited: '{curr}' is a symlink.")
+        curr = curr.parent
+
+
+def validate_path_safety(
+    path: Path,
+    allowed_roots: list[Path],
+) -> Path:
+    """Validate that path is contained within one of the allowed roots and has no symlink/path traversal."""
+    check_no_symlinks(path)
+    resolved = path.resolve()
+    if not is_safe_contained_path(resolved, allowed_roots):
+        raise RuntimeError(
+            f"FATAL: Unauthorized path rejected: '{path}' (resolved: '{resolved}') is outside allowed roots."
+        )
+    return resolved
+
+
+def validate_target_path(
+    target: Path,
+    allowed_roots: list[Path] | None = None,
+) -> Path:
+    """Validate that target path is strictly an authorized production dataset."""
+    effective_roots = allowed_roots if allowed_roots is not None else DEFAULT_ALLOWED_DATA_ROOTS
+    resolved = target.resolve()
+    check_no_symlinks(target)
+
+    # Disallow source code, git, env files explicitly
+    prohibited_roots = [
+        PROJECT_ROOT / "src",
+        PROJECT_ROOT / ".git",
+    ]
+    for p_root in prohibited_roots:
+        if is_safe_contained_path(resolved, [p_root]):
+            raise RuntimeError(
+                f"FATAL: Target path '{target}' rejected: targets inside project source or git directories are strictly forbidden."
+            )
+
+    if resolved == (PROJECT_ROOT / ".env").resolve():
+        raise RuntimeError(f"FATAL: Target path '{target}' rejected: .env cannot be a target.")
+
+    # Must have .parquet extension
+    if target.suffix.lower() != ".parquet":
+        raise RuntimeError(
+            f"FATAL: Target path '{target}' rejected: only '.parquet' files are authorized data targets, got '{target.suffix}'."
+        )
+
+    if not is_safe_contained_path(resolved, effective_roots):
+        raise RuntimeError(
+            f"FATAL: Target path rejected: '{target}' (resolved: '{resolved}') is outside permitted data roots."
+        )
+    return resolved
+
+
+def validate_staged_path(
+    staged: Path,
+    target: Path,
+    allowed_roots: list[Path] | None = None,
+) -> Path:
+    """Validate that staged path is safe, within allowed roots, and matches target naming."""
+    effective_roots = allowed_roots if allowed_roots is not None else DEFAULT_ALLOWED_DATA_ROOTS
+    resolved = staged.resolve()
+    check_no_symlinks(staged)
+
+    if not is_safe_contained_path(resolved, effective_roots):
+        raise RuntimeError(
+            f"FATAL: Staged path rejected: '{staged}' is outside permitted data roots."
+        )
+
+    if not (staged.name.endswith(".stage") or staged.suffix.lower() == ".parquet"):
+        raise RuntimeError(
+            f"FATAL: Staged file '{staged}' rejected: unexpected extension."
+        )
+    return resolved
+
+
+def validate_backup_path(
+    backup: Path,
+    allowed_backup_roots: list[Path] | None = None,
+) -> Path:
+    """Validate that backup path is strictly within authorized backup roots."""
+    effective_roots = allowed_backup_roots if allowed_backup_roots is not None else DEFAULT_ALLOWED_BACKUP_ROOTS
+    resolved = backup.resolve()
+    check_no_symlinks(backup)
+
+    if backup.suffix.lower() != ".parquet":
+        raise RuntimeError(
+            f"FATAL: Backup file '{backup}' rejected: must have '.parquet' extension."
+        )
+
+    if not is_safe_contained_path(resolved, effective_roots):
+        raise RuntimeError(
+            f"FATAL: Backup path rejected: '{backup}' is outside authorized backup roots."
+        )
+    return resolved
+
+
+def validate_directory_safety(
+    dir_path: Path,
+    allowed_roots: list[Path] | None = None,
+) -> Path:
+    """Validate that a directory is strictly within authorized roots and has no symlink traversal."""
+    resolved = dir_path.resolve()
+    check_no_symlinks(dir_path)
+
+    effective_roots = allowed_roots if allowed_roots is not None else DEFAULT_ALLOWED_BACKUP_ROOTS
+    if not is_safe_contained_path(resolved, effective_roots):
+        raise RuntimeError(
+            f"FATAL: Directory rejected: '{dir_path}' is outside authorized roots."
+        )
+    return resolved
+
+
+def validate_journal_path(
+    journal_path: Path,
+    allowed_journal_roots: list[Path] | None = None,
+) -> Path:
+    """Validate that journal file is strictly within authorized journal roots and has .json extension."""
+    resolved = journal_path.resolve()
+    check_no_symlinks(journal_path)
+
+    if journal_path.suffix.lower() != ".json":
+        raise RuntimeError(
+            f"FATAL: Transaction journal rejected: '{journal_path}' must have '.json' extension."
+        )
+
+    effective_roots = allowed_journal_roots if allowed_journal_roots is not None else DEFAULT_ALLOWED_JOURNAL_ROOTS
+    if not is_safe_contained_path(resolved, effective_roots):
+        raise RuntimeError(
+            f"FATAL: Transaction journal rejected: '{journal_path}' is outside authorized journal roots."
+        )
+    return resolved
+
+
+def load_trusted_checksums(backup_dir: Path | None, require_file: bool = True) -> dict[str, str]:
+    """Load trusted SHA-256 checksums from checksums.sha256 in backup_dir.
+
+    Strictly validates:
+    - backup_dir must be provided and exist.
+    - checksums.sha256 must exist if require_file=True.
+    - Each line must contain: <64-hex SHA-256> [*]<filename>.
+    - Reject malformed, non-hex, duplicate, or ambiguous entries.
+    """
+    if not backup_dir:
+        raise RuntimeError("FATAL: backup_dir not provided when loading trusted checksums.")
+    backup_dir = Path(backup_dir)
+    if not backup_dir.exists() or not backup_dir.is_dir():
+        raise RuntimeError(f"FATAL: backup_dir does not exist or is not a directory: {backup_dir}")
+
+    checksum_file = backup_dir / "checksums.sha256"
+    if not checksum_file.exists():
+        if require_file:
+            raise RuntimeError(
+                f"FATAL: Required trusted checksums file missing at {checksum_file}. "
+                "Cannot establish trusted baseline independently of transaction journal."
+            )
+        return {}
+
+    checksums: dict[str, str] = {}
+    with open(checksum_file, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    if not lines and require_file:
+        raise RuntimeError(f"FATAL: Trusted checksums file {checksum_file} is empty.")
+
+    valid_entry_found = False
+    for line_idx, raw_line in enumerate(lines, 1):
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+
+        parts = line.split(maxsplit=1)
+        if len(parts) != 2:
+            raise RuntimeError(
+                f"FATAL: Malformed entry in {checksum_file} line {line_idx}: expected '<hash> <filename>', got '{line}'"
+            )
+        sha, name = parts
+        sha = sha.strip().lower()
+        if not HEX_64_PATTERN.match(sha):
+            raise RuntimeError(
+                f"FATAL: Malformed SHA-256 hash in {checksum_file} line {line_idx}: '{sha}' (must be 64 hex characters)"
+            )
+        cleaned_name = name.strip()
+        if cleaned_name.startswith("*"):
+            cleaned_name = cleaned_name[1:].strip()
+        if "/" in cleaned_name or "\\" in cleaned_name or ".." in cleaned_name:
+            raise RuntimeError(
+                f"FATAL: Path traversal or directory separator rejected in {checksum_file} line {line_idx}: '{cleaned_name}'"
+            )
+        filename = Path(cleaned_name).name
+        if not filename:
+            raise RuntimeError(
+                f"FATAL: Missing filename in {checksum_file} line {line_idx}: '{line}'"
+            )
+
+        if filename in checksums:
+            if checksums[filename] != sha:
+                raise RuntimeError(
+                    f"FATAL: Ambiguous conflicting checksums for '{filename}' in {checksum_file} line {line_idx}"
+                )
+            raise RuntimeError(
+                f"FATAL: Duplicate checksum entry for '{filename}' in {checksum_file} line {line_idx}"
+            )
+
+        checksums[filename] = sha
+        valid_entry_found = True
+
+    if require_file and not valid_entry_found:
+        raise RuntimeError(f"FATAL: No valid checksum entries found in {checksum_file}.")
+
+    return checksums
+
+
+def check_and_recover_transactions(
+    journal_path: Path | None = None,
+    allowed_roots: list[Path] | None = None,
+    backup_dir: Path | None = None,
+) -> bool:
+    """Check for interrupted multi-file transactions and restore consistent state before execution."""
+    effective_journal_roots = allowed_roots if allowed_roots is not None else DEFAULT_ALLOWED_JOURNAL_ROOTS
+    effective_backup_roots = allowed_roots if allowed_roots is not None else DEFAULT_ALLOWED_BACKUP_ROOTS
+    effective_data_roots = allowed_roots if allowed_roots is not None else DEFAULT_ALLOWED_DATA_ROOTS
+
+    if journal_path is None:
+        if backup_dir is not None:
+            candidate = Path(backup_dir) / "transaction_journal.json"
+            if is_safe_contained_path(candidate.resolve(), effective_journal_roots):
+                journal_path = candidate
+            else:
+                journal_path = DEFAULT_TRANSACTION_JOURNAL
+        elif allowed_roots:
+            journal_path = allowed_roots[0] / "transaction_journal.json"
+        else:
+            journal_path = DEFAULT_TRANSACTION_JOURNAL
+    else:
+        journal_path = Path(journal_path)
+
+    validate_journal_path(journal_path, effective_journal_roots)
+
+    if not journal_path.exists():
+        return False
+
+    try:
+        with open(journal_path, "r", encoding="utf-8") as f:
+            journal = json.load(f)
+    except Exception as exc:
+        raise RuntimeError(
+            f"FATAL: Malformed or unreadable transaction journal at {journal_path}: {exc}. Fail-closed."
+        ) from exc
+
+    if not isinstance(journal, dict):
+        raise RuntimeError(
+            f"FATAL: Malformed transaction journal at {journal_path}: root must be a JSON object, got {type(journal).__name__}."
+        )
+
+    state = journal.get("state")
+    if state in (TX_STATE_COMMITTED, TX_STATE_ABORTED_RECOVERED):
+        return False
+
+    if state not in (TX_STATE_STAGED, TX_STATE_RECOVERING):
+        raise RuntimeError(
+            f"FATAL: Unknown or ambiguous transaction state '{state}' in {journal_path}. Halting pipeline."
+        )
+
+    files = journal.get("files")
+    if not isinstance(files, list) or len(files) == 0:
+        raise RuntimeError(
+            f"FATAL: Transaction journal in '{state}' state has no valid files list: {journal_path}"
+        )
+
+    backup_dir_str = journal.get("backup_dir", "")
+    if not backup_dir_str:
+        raise RuntimeError(
+            f"FATAL: Transaction journal has missing or empty 'backup_dir' field: {journal_path}"
+        )
+    backup_dir = Path(backup_dir_str)
+    validate_directory_safety(backup_dir, effective_backup_roots)
+
+    if not backup_dir.exists() or not backup_dir.is_dir():
+        raise RuntimeError(
+            f"FATAL: Backup directory specified in journal does not exist: {backup_dir}"
+        )
+
+    trusted_hashes = load_trusted_checksums(backup_dir, require_file=True)
+
+    # -------------------------------------------------------------
+    # PHASE 1: PRE-FLIGHT VALIDATION (All or Nothing - Zero writes)
+    # -------------------------------------------------------------
+    validated_plan: list[dict[str, Any]] = []
+    for item in files:
+        if not isinstance(item, dict) or "target" not in item:
+            raise RuntimeError(f"FATAL: Malformed file entry in transaction journal: {item}")
+
+        target = Path(item["target"])
+        validate_target_path(target, effective_data_roots)
+
+        staged_path_str = item.get("staged")
+        staged = Path(staged_path_str) if staged_path_str else target.with_name(target.name + ".stage")
+        validate_staged_path(staged, target, effective_data_roots)
+
+        if "backup" in item and item["backup"]:
+            backup = Path(item["backup"])
+        else:
+            backup = backup_dir / target.name
+
+        validate_backup_path(backup, effective_backup_roots)
+
+        if not backup.exists():
+            raise RuntimeError(
+                f"FATAL: Required backup missing: {backup}. Cannot safely restore baseline. Preserving all artifacts."
+            )
+
+        if target.name not in trusted_hashes:
+            raise RuntimeError(
+                f"FATAL: No trusted baseline checksum found for '{target.name}' in {backup_dir / 'checksums.sha256'}."
+            )
+        trusted_sha = trusted_hashes[target.name]
+
+        journal_sha = item.get("backup_sha256")
+        if journal_sha:
+            clean_journal_sha = journal_sha.strip().lower()
+            if not HEX_64_PATTERN.match(clean_journal_sha):
+                raise RuntimeError(
+                    f"FATAL: Malformed SHA-256 hash in journal for {target.name}: '{journal_sha}'"
+                )
+            if clean_journal_sha != trusted_sha:
+                raise RuntimeError(
+                    f"FATAL: Checksum conflict for {target.name}: journal records {journal_sha}, "
+                    f"but trusted baseline records {trusted_sha}."
+                )
+
+        actual_sha = compute_sha256(backup)
+        if actual_sha != trusted_sha:
+            raise RuntimeError(
+                f"FATAL: Backup integrity check failed for {backup}: expected {trusted_sha}, found {actual_sha}."
+            )
+
+        validated_plan.append({
+            "target": target,
+            "staged": staged,
+            "backup": backup,
+            "expected_sha": trusted_sha,
+        })
+
+    logger.critical(
+        f"Detected incomplete transaction ({journal.get('transaction_id')}) in state '{state}'. "
+        f"All {len(validated_plan)} backups verified against trusted baseline. Initiating durable rollback..."
+    )
+
+    # -------------------------------------------------------------
+    # PHASE 2: ATOMIC RESTORATION WITH PROGRESS TRACKING
+    # -------------------------------------------------------------
+    journal["state"] = TX_STATE_RECOVERING
+    journal["recovering_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+    durable_json_write(journal_path, journal)
+
+    try:
+        for item_meta in validated_plan:
+            backup = item_meta["backup"]
+            target = item_meta["target"]
+            expected_sha = item_meta["expected_sha"]
+
+            tmp_restore = target.with_suffix(target.suffix + ".restore_tmp")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(backup, tmp_restore)
+
+            restored_tmp_sha = compute_sha256(tmp_restore)
+            if restored_tmp_sha != expected_sha:
+                if tmp_restore.exists():
+                    tmp_restore.unlink()
+                raise RuntimeError(
+                    f"FATAL: Checksum verification failed on temporary restore file {tmp_restore}: "
+                    f"expected {expected_sha}, got {restored_tmp_sha}"
+                )
+
+            tmp_restore.replace(target)
+            logger.info(f"Atomically restored {target} from verified backup {backup}")
+
+        # -------------------------------------------------------------
+        # PHASE 3: POST-RESTORATION VERIFICATION & STAGED CLEANUP
+        # -------------------------------------------------------------
+        for item_meta in validated_plan:
+            target = item_meta["target"]
+            expected_sha = item_meta["expected_sha"]
+            if not target.exists() or compute_sha256(target) != expected_sha:
+                raise RuntimeError(
+                    f"FATAL: Post-restoration verification failed for {target}. Baseline not restored."
+                )
+
+        for item_meta in validated_plan:
+            staged = item_meta["staged"]
+            if staged.exists():
+                try:
+                    staged.unlink()
+                    logger.info(f"Cleaned up staged file after verified recovery: {staged}")
+                except Exception as e:
+                    logger.warning(f"Failed to remove staged file {staged}: {e}")
+
+        journal["state"] = TX_STATE_ABORTED_RECOVERED
+        journal["recovered_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        durable_json_write(journal_path, journal)
+
+        logger.info("Transaction recovery complete. All files restored and verified against baseline checksums.")
+        return True
+
+    except Exception as exc:
+        logger.critical(
+            f"FATAL: Recovery failed during restoration: {exc}. "
+            "Journal preserved in RECOVERING state, staged artifacts preserved."
+        )
+        raise
+
+
+def commit_multi_file_transaction(
+    staged_targets: list[tuple[Path, Path]],
+    backup_dir: Path | None = None,
+    journal_path: Path | None = None,
+    allowed_roots: list[Path] | None = None,
+) -> None:
+    """Commit multiple staged files atomically with write-ahead journal tracking."""
+    if backup_dir is None:
+        raise ValueError("commit_multi_file_transaction requires a valid backup_dir containing pre-transaction backups.")
+    backup_dir = Path(backup_dir)
+
+    effective_journal_roots = allowed_roots if allowed_roots is not None else DEFAULT_ALLOWED_JOURNAL_ROOTS
+    effective_backup_roots = allowed_roots if allowed_roots is not None else DEFAULT_ALLOWED_BACKUP_ROOTS
+    effective_data_roots = allowed_roots if allowed_roots is not None else DEFAULT_ALLOWED_DATA_ROOTS
+
+    if journal_path is None:
+        candidate = backup_dir / "transaction_journal.json"
+        if is_safe_contained_path(candidate.resolve(), effective_journal_roots):
+            journal_path = candidate
+        else:
+            journal_path = DEFAULT_TRANSACTION_JOURNAL
+    else:
+        journal_path = Path(journal_path)
+
+    validate_journal_path(journal_path, effective_journal_roots)
+    validate_directory_safety(backup_dir, effective_backup_roots)
+
+    if not backup_dir.exists() or not backup_dir.is_dir():
+        raise RuntimeError(f"FATAL: Specified backup_dir does not exist or is not a directory: {backup_dir}")
+
+    journal_path.parent.mkdir(parents=True, exist_ok=True)
+    tx_id = f"tx_{dt.datetime.now(dt.timezone.utc).strftime('%Y%m%d_%H%M%S')}"
+
+    trusted_hashes = load_trusted_checksums(backup_dir, require_file=True)
+    files_meta: list[dict[str, str]] = []
+
+    for staged, target in staged_targets:
+        validate_target_path(target, effective_data_roots)
+        validate_staged_path(staged, target, effective_data_roots)
+
+        if not staged.exists():
+            raise RuntimeError(f"FATAL: Staged file does not exist before commit: {staged}")
+
+        backup = backup_dir / target.name
+        validate_backup_path(backup, effective_backup_roots)
+        if not backup.exists():
+            raise RuntimeError(f"FATAL: Missing required backup for target {target}: {backup} does not exist.")
+
+        if target.name not in trusted_hashes:
+            raise RuntimeError(
+                f"FATAL: Target '{target.name}' missing from trusted checksums file {backup_dir / 'checksums.sha256'}."
+            )
+        trusted_sha = trusted_hashes[target.name]
+
+        actual_backup_sha = compute_sha256(backup)
+        if actual_backup_sha != trusted_sha:
+            raise RuntimeError(
+                f"FATAL: Backup {backup} failed checksum verification against checksums.sha256: "
+                f"expected {trusted_sha}, got {actual_backup_sha}"
+            )
+
+        files_meta.append({
+            "target": str(target.resolve()),
+            "staged": str(staged.resolve()),
+            "backup": str(backup.resolve()),
+            "backup_sha256": actual_backup_sha,
+        })
+
+    journal_data = {
+        "transaction_id": tx_id,
+        "state": TX_STATE_STAGED,
+        "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+        "backup_dir": str(backup_dir.resolve()),
+        "files": files_meta,
+    }
+
+    durable_json_write(journal_path, journal_data)
+
+    try:
+        for staged, target in staged_targets:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            staged.replace(target)
+
+        journal_data["state"] = TX_STATE_COMMITTED
+        journal_data["committed_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+        durable_json_write(journal_path, journal_data)
+    except Exception as exc:
+        logger.critical(f"Error during atomic commit phase: {exc}. Invoking immediate recovery.")
+        check_and_recover_transactions(journal_path, allowed_roots=allowed_roots)
+        raise
+
+
+def update_manifest_chunk(
+    manifest_path: Path,
+    chunk_key: str,
+    status: str,
+    article_count: int,
+) -> None:
+    """Atomically record chunk retrieval status and article count to manifest."""
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest: dict[str, Any] = {"chunks": {}, "updated_at": dt.datetime.now(dt.timezone.utc).isoformat()}
+    if manifest_path.exists():
+        try:
+            with open(manifest_path, "r") as f:
+                manifest = json.load(f)
+        except Exception:
+            pass
+
+    if "chunks" not in manifest:
+        manifest["chunks"] = {}
+
+    manifest["chunks"][chunk_key] = {
+        "status": status,
+        "article_count": article_count,
+        "updated_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+    }
+    manifest["updated_at"] = dt.datetime.now(dt.timezone.utc).isoformat()
+
+    tmp_manifest = manifest_path.with_suffix(".tmp")
+    with open(tmp_manifest, "w") as f:
+        json.dump(manifest, f, indent=2)
+    tmp_manifest.replace(manifest_path)
+
+
+def get_net_new_articles(
+    incoming_raw_df: pd.DataFrame,
+    existing_processed_df: pd.DataFrame,
+) -> pd.DataFrame:
+    """Identify articles in incoming_raw_df that are not already present in existing_processed_df."""
+    if incoming_raw_df.empty or existing_processed_df.empty:
+        return incoming_raw_df
+
+    proc = existing_processed_df.copy()
+    proc["published_at"] = pd.to_datetime(proc["published_at"], utc=True)
+
+    proc_ids = set(proc["raw_id"].fillna("").astype(str).str.strip().loc[lambda s: s != ""])
+    proc_urls = set(proc["url"].fillna("").astype(str).str.strip().loc[lambda s: s != ""])
+    proc_head_ts = set(
+        zip(
+            proc["headline"].astype(str).str.lower().str.strip(),
+            proc["published_at"],
+        )
+    )
+
+    incoming = incoming_raw_df.copy()
+    incoming["published_at"] = pd.to_datetime(incoming["published_at"], utc=True)
+
+    is_new = []
+    for _, row in incoming.iterrows():
+        raw_id = str(row.get("raw_id", "") or "").strip()
+        url = str(row.get("url", "") or "").strip()
+        head_ts = (str(row.get("headline", "") or "").lower().strip(), row["published_at"])
+
+        if raw_id and raw_id in proc_ids:
+            is_new.append(False)
+        elif url and url in proc_urls:
+            is_new.append(False)
+        elif head_ts in proc_head_ts:
+            is_new.append(False)
+        else:
+            is_new.append(True)
+
+    return incoming_raw_df.loc[is_new].reset_index(drop=True)
 
 
 def fetch_finnhub_news(
@@ -393,22 +1146,25 @@ def fetch_finnhub_news(
     client: finnhub.Client | None = None,
     chunk_days: int = 1,
     retry_delay: float = 1.0,
+    request_delay_seconds: float = 0.15,
+    staged_chunks_dir: Path | None = None,
+    manifest_path: Path | None = None,
+    max_cache_age_hours: float | None = None,
 ) -> pd.DataFrame:
-    """Fetch company news from Finnhub in chunked date intervals with rate-limit handling.
+    """Fetch company news from Finnhub in chunked date intervals with rate-limit handling and staging.
 
     Uses short date chunks (default 1 calendar day per request) to prevent truncation.
     Finnhub silently truncates responses at ~245-250 items sorted newest-first.
+
+    Durable staging:
+    If staged_chunks_dir is provided, successfully retrieved payloads are persisted per-date
+    (or marked as empty via .empty marker), allowing offline resumption without re-fetching.
 
     Distinguishes three collection outcomes via df.attrs["status"]:
     - complete: All requested chunks were retrieved successfully (even if 0 articles).
     - partial: Some chunks failed, but >= 1 chunk succeeded; returns articles from successful chunks.
     - failed: All requested chunks failed after retries.
     """
-    if client is None:
-        client = get_finnhub_client()
-        if client is None:
-            raise RuntimeError("Finnhub client could not be initialized.")
-
     start_dt = pd.to_datetime(start_date).date()
     end_dt = pd.to_datetime(end_date).date()
 
@@ -417,12 +1173,80 @@ def fetch_finnhub_news(
     failed_chunks: list[tuple[str, str]] = []
     successful_chunks: list[tuple[str, str]] = []
 
+    if staged_chunks_dir is not None:
+        staged_chunks_dir.mkdir(parents=True, exist_ok=True)
+
     logger.info(
         f"Querying Finnhub for {ticker} across {len(chunks)} chunk(s) "
         f"({start_dt} to {end_dt}, chunk_days={chunk_days})..."
     )
 
     for chunk_idx, (from_str, to_str) in enumerate(chunks, 1):
+        chunk_stem = f"{ticker}_{from_str}" if from_str == to_str else f"{ticker}_{from_str}_{to_str}"
+        chunk_key = f"{ticker}:{from_str}:{to_str}"
+        parquet_file = (staged_chunks_dir / f"{chunk_stem}.parquet") if staged_chunks_dir else None
+        empty_file = (staged_chunks_dir / f"{chunk_stem}.empty") if staged_chunks_dir else None
+
+        # Check manifest status if manifest exists: do not treat a failed retrieval as cached
+        chunk_failed_in_manifest = False
+        if manifest_path and manifest_path.exists():
+            try:
+                with open(manifest_path, "r", encoding="utf-8") as mf:
+                    m_data = json.load(mf)
+                c_info = m_data.get("chunks", {}).get(chunk_key) or m_data.get("chunks", {}).get(f"{from_str}:{to_str}")
+                if c_info and c_info.get("status") == STATUS_FAILED:
+                    chunk_failed_in_manifest = True
+            except Exception:
+                pass
+
+        # Check expiration if configured
+        is_expired = False
+        if max_cache_age_hours is not None:
+            cache_target = empty_file if (empty_file and empty_file.exists()) else parquet_file
+            if cache_target and cache_target.exists():
+                age_seconds = time.time() - cache_target.stat().st_mtime
+                if age_seconds > max_cache_age_hours * 3600.0:
+                    is_expired = True
+                    logger.info(
+                        f"Cached chunk {chunk_stem} has expired (age: {age_seconds / 3600.0:.2f}h > {max_cache_age_hours}h). "
+                        "Attempting refresh from client..."
+                    )
+
+        # Check for pre-existing staged payload (if not expired and not marked failed in manifest)
+        if not is_expired and not chunk_failed_in_manifest:
+            if empty_file and empty_file.exists():
+                logger.info(f"Loaded staged empty chunk for [{from_str} to {to_str}].")
+                successful_chunks.append((from_str, to_str))
+                if manifest_path:
+                    update_manifest_chunk(manifest_path, chunk_key, STATUS_COMPLETE, 0)
+                continue
+
+            if parquet_file and parquet_file.exists():
+                try:
+                    staged_df = pd.read_parquet(parquet_file)
+                    for col in NEWS_COLUMNS:
+                        if col not in staged_df.columns:
+                            raise ValueError(f"Corrupted chunk cache: missing required column '{col}'")
+                    staged_records = staged_df.to_dict(orient="records")
+                    for rec in staged_records:
+                        rec["published_at"] = pd.to_datetime(rec["published_at"], utc=True)
+                        articles.append(rec)
+                    logger.info(
+                        f"Loaded {len(staged_records)} staged article(s) for [{from_str} to {to_str}] from {parquet_file.name}."
+                    )
+                    successful_chunks.append((from_str, to_str))
+                    if manifest_path:
+                        update_manifest_chunk(manifest_path, chunk_key, STATUS_COMPLETE, len(staged_records))
+                    continue
+                except Exception as exc:
+                    logger.warning(f"Failed to read staged chunk file {parquet_file}: {exc}. Refetching...")
+
+        # If not already staged, fetch from client
+        if client is None:
+            client = get_finnhub_client()
+            if client is None:
+                raise RuntimeError("Finnhub client could not be initialized.")
+
         retries = 3
         success = False
         batch_items: list[dict[str, Any]] = []
@@ -435,22 +1259,34 @@ def fetch_finnhub_news(
                 break
             except Exception as exc:
                 clean_err = str(exc).split("?")[0]
+                err_msg = str(exc).lower()
+                is_rate_limit = "429" in err_msg or "rate limit" in err_msg
                 logger.warning(
                     f"Finnhub request failed (attempt {attempt + 1}/{retries}) "
                     f"for [{from_str} to {to_str}]: {type(exc).__name__} ({clean_err})"
                 )
                 if retry_delay > 0:
-                    time.sleep(retry_delay * (attempt + 1))
+                    sleep_secs = max(retry_delay * (attempt + 1) * 2.0, 2.0) if is_rate_limit else retry_delay * (attempt + 1)
+                    time.sleep(sleep_secs)
 
         if not success:
             failed_chunks.append((from_str, to_str))
             logger.error(
                 f"Failed to fetch Finnhub news for window [{from_str} to {to_str}] after {retries} retries."
             )
+            # If this was an expired cache refresh attempt, preserve existing valid cache payload on disk
+            if is_expired and parquet_file and parquet_file.exists():
+                logger.warning(
+                    f"Refresh failed for expired chunk [{from_str} to {to_str}]. "
+                    f"Preserving existing valid cache payload on disk."
+                )
+            elif manifest_path:
+                update_manifest_chunk(manifest_path, chunk_key, STATUS_FAILED, 0)
             continue
 
         successful_chunks.append((from_str, to_str))
 
+        chunk_articles: list[dict[str, Any]] = []
         chunk_timestamps: list[pd.Timestamp] = []
         for item in batch_items:
             headline = (item.get("headline") or "").strip()
@@ -467,20 +1303,41 @@ def fetch_finnhub_news(
                 continue
 
             chunk_timestamps.append(pub_utc)
+            art = {
+                "ticker": ticker,
+                "published_at": pub_utc,
+                "headline": headline,
+                "summary": (item.get("summary") or "").strip(),
+                "source": (item.get("source") or "Unknown").strip(),
+                "url": (item.get("url") or "").strip(),
+                "provider": "finnhub",
+                "is_fallback": False,
+                "raw_id": str(item.get("id") or ""),
+            }
+            chunk_articles.append(art)
+            articles.append(art)
 
-            articles.append(
-                {
-                    "ticker": ticker,
-                    "published_at": pub_utc,
-                    "headline": headline,
-                    "summary": (item.get("summary") or "").strip(),
-                    "source": (item.get("source") or "Unknown").strip(),
-                    "url": (item.get("url") or "").strip(),
-                    "provider": "finnhub",
-                    "is_fallback": False,
-                    "raw_id": str(item.get("id") or ""),
-                }
-            )
+        # Stage payload durably using atomic write
+        if staged_chunks_dir is not None:
+            if not chunk_articles:
+                empty_file.touch()
+                if parquet_file and parquet_file.exists():
+                    try:
+                        parquet_file.unlink()
+                    except Exception:
+                        pass
+            else:
+                tmp_chunk = parquet_file.with_suffix(".parquet.tmp")
+                pd.DataFrame(chunk_articles).to_parquet(tmp_chunk)
+                tmp_chunk.replace(parquet_file)
+                if empty_file and empty_file.exists():
+                    try:
+                        empty_file.unlink()
+                    except Exception:
+                        pass
+
+        if manifest_path is not None:
+            update_manifest_chunk(manifest_path, chunk_key, STATUS_COMPLETE, len(chunk_articles))
 
         earliest_ts = min(chunk_timestamps).strftime("%Y-%m-%d %H:%M:%SZ") if chunk_timestamps else "None"
         latest_ts = max(chunk_timestamps).strftime("%Y-%m-%d %H:%M:%SZ") if chunk_timestamps else "None"
@@ -496,8 +1353,8 @@ def fetch_finnhub_news(
                 "which is near Finnhub's response cap (~250). Earlier headlines in this window may be truncated."
             )
 
-        if retry_delay > 0:
-            time.sleep(0.15)
+        if request_delay_seconds > 0 and chunk_idx < len(chunks):
+            time.sleep(request_delay_seconds)
 
     total_chunks = len(chunks)
     failed_count = len(failed_chunks)
@@ -611,6 +1468,10 @@ def fetch_news(
     client: finnhub.Client | None = None,
     chunk_days: int = 1,
     retry_delay: float = 1.0,
+    request_delay_seconds: float = 0.15,
+    staged_chunks_dir: Path | None = None,
+    manifest_path: Path | None = None,
+    max_cache_age_hours: float | None = None,
 ) -> pd.DataFrame:
     """Fetch news from Finnhub (primary) and Yahoo Finance (fallback).
 
@@ -637,6 +1498,10 @@ def fetch_news(
                 client=client,
                 chunk_days=chunk_days,
                 retry_delay=retry_delay,
+                request_delay_seconds=request_delay_seconds,
+                staged_chunks_dir=staged_chunks_dir,
+                manifest_path=manifest_path,
+                max_cache_age_hours=max_cache_age_hours,
             )
             finnhub_status = finnhub_df.attrs.get("status", STATUS_COMPLETE)
             failed_chunks = finnhub_df.attrs.get("failed_chunks", [])
@@ -860,6 +1725,7 @@ def merge_sentiment_with_market_features(
     output_path: Path | None = MARKET_FEATURES_FILE,
     refresh_start_date: str | dt.date | None = None,
     refresh_end_date: str | dt.date | None = None,
+    successful_trading_days: set[dt.date] | list[dt.date] | None = None,
     full_rebuild: bool = False,
 ) -> pd.DataFrame:
     """Merge daily sentiment into market_features.parquet safely and incrementally.
@@ -867,6 +1733,9 @@ def merge_sentiment_with_market_features(
     Behavior:
     1. full_rebuild=False (Incremental Mode, Default):
        - Preserves sentiment values for market dates not being refreshed.
+       - If successful_trading_days is provided, only market sessions in that set are
+         refreshed; all other dates (failed chunks, unattempted dates, or historical dates)
+         are strictly untouched.
        - If refresh_start_date and refresh_end_date are provided, only trading dates in
          that inclusive window are refreshed.
        - If refresh dates are omitted, only dates present in daily_sentiment_df are updated.
@@ -912,6 +1781,17 @@ def merge_sentiment_with_market_features(
             for col in SENTIMENT_METRIC_COLUMNS:
                 market_df[col] = np.nan
             market_df["sentiment_coverage"] = 0
+        elif successful_trading_days is not None:
+            succ_set = {pd.to_datetime(d).date() for d in successful_trading_days}
+            market_dates = pd.Series([d.date() for d in market_df.index], index=market_df.index)
+            refresh_mask = market_dates.isin(succ_set)
+            logger.info(
+                f"Empty sentiment provided with explicit successful trading days. "
+                f"Marking {int(refresh_mask.sum())} session(s) as NaN with 0 coverage."
+            )
+            for col in SENTIMENT_METRIC_COLUMNS:
+                market_df.loc[refresh_mask, col] = np.nan
+            market_df.loc[refresh_mask, "sentiment_coverage"] = 0
         else:
             logger.warning(
                 "Empty or None daily sentiment provided for incremental update. "
@@ -938,7 +1818,14 @@ def merge_sentiment_with_market_features(
             market_df.loc[common_idx, "sentiment_coverage"] = 1
         else:
             # Incremental update: determine refresh window
-            if refresh_start_date is not None and refresh_end_date is not None:
+            if successful_trading_days is not None:
+                succ_set = {pd.to_datetime(d).date() for d in successful_trading_days}
+                market_dates = pd.Series([d.date() for d in market_df.index], index=market_df.index)
+                refresh_mask = market_dates.isin(succ_set)
+                logger.info(
+                    f"Executing incremental sentiment update for {int(refresh_mask.sum())} explicit successful session(s)."
+                )
+            elif refresh_start_date is not None and refresh_end_date is not None:
                 ref_start = pd.to_datetime(refresh_start_date).date()
                 ref_end = pd.to_datetime(refresh_end_date).date()
                 market_dates = pd.Series([d.date() for d in market_df.index], index=market_df.index)
@@ -1202,12 +2089,13 @@ def run_test_mode(ticker: str = "AAPL") -> None:
     # 6. Incremental vs Full Rebuild merge & invariants
     print("[6/7] Testing incremental merge, full rebuild, idempotence, and invariants...")
     # Synthetic market DataFrame (5 trading days)
+    test_tmp_dir = tempfile.TemporaryDirectory()
+    temp_market_path = Path(test_tmp_dir.name) / "temp_test_market_features.parquet"
     dates = pd.date_range("2026-10-12", periods=5, freq="B")
     base_market = pd.DataFrame(
         {"Close": [100.0, 101.0, 102.0, 103.0, 104.0], "Daily_Return": [0.01, 0.01, 0.01, 0.01, 0.01]},
         index=dates,
     )
-    temp_market_path = PROCESSED_DATA_DIR / "temp_test_market_features.parquet"
     base_market.to_parquet(temp_market_path)
 
     try:
@@ -1360,8 +2248,7 @@ def run_test_mode(ticker: str = "AAPL") -> None:
         print("  [OK] Total retrieval failure correctly identified (not treated as successful empty).")
 
     finally:
-        if temp_market_path.exists():
-            temp_market_path.unlink()
+        test_tmp_dir.cleanup()
 
     print("=" * 70)
     print("ALL NEWS SENTIMENT INTEGRITY TESTS PASSED SUCCESSFULLY!")
@@ -1381,14 +2268,22 @@ def run_production_pipeline(
     processed_news_path: Path | None = None,
     analyzer: Any = None,
     retry_delay: float = 1.0,
+    request_delay_seconds: float = 0.15,
+    staged_chunks_dir: Path | None = None,
+    manifest_path: Path | None = None,
+    backup_dir: Path | None = None,
+    journal_path: Path | None = None,
+    allowed_roots: list[Path] | None = None,
+    max_cache_age_hours: float | None = None,
 ) -> dict[str, Any]:
-    """Execute news ingestion, FinBERT scoring, and market features merge.
+    """Execute news ingestion, FinBERT scoring, and market features merge with transaction safety.
 
     Safely distinguishes:
     1. Complete: All chunks succeeded. If 0 articles, confirmed empty without modifying features.
     2. Partial: Some chunks failed; preserves articles from successful chunks, and restricts
        incremental update strictly to observed dates to prevent wiping unretrieved dates.
     3. Failed: All chunks failed; aborts pipeline to prevent clearing/overwriting historical data.
+    4. Crash-Resilience: Supports Write-Ahead Transaction Journal and per-chunk staging.
     """
     if end_date is None:
         end_date = dt.date.today().strftime("%Y-%m-%d")
@@ -1400,6 +2295,48 @@ def run_production_pipeline(
     raw_file.parent.mkdir(parents=True, exist_ok=True)
     proc_file.parent.mkdir(parents=True, exist_ok=True)
 
+    # Resolve and validate cache and manifest paths
+    effective_data_roots = allowed_roots if allowed_roots is not None else (DEFAULT_ALLOWED_DATA_ROOTS + [raw_file.parent])
+    effective_staged_chunks_dir = Path(staged_chunks_dir) if staged_chunks_dir is not None else (raw_file.parent / "staged_chunks")
+    effective_manifest_path = Path(manifest_path) if manifest_path is not None else (raw_file.parent / "news_retrieval_manifest.json")
+
+    validate_path_safety(effective_staged_chunks_dir, effective_data_roots)
+    validate_path_safety(effective_manifest_path, effective_data_roots)
+    if effective_manifest_path.suffix.lower() != ".json":
+        raise RuntimeError(f"FATAL: Manifest path '{effective_manifest_path}' rejected: must have '.json' extension.")
+
+    # 0. Startup transaction recovery
+    effective_journal_roots = allowed_roots if allowed_roots is not None else DEFAULT_ALLOWED_JOURNAL_ROOTS
+    if journal_path is not None:
+        journal_file = Path(journal_path)
+    elif backup_dir is not None:
+        candidate = Path(backup_dir) / "transaction_journal.json"
+        if is_safe_contained_path(candidate.resolve(), effective_journal_roots):
+            journal_file = candidate
+        else:
+            journal_file = DEFAULT_TRANSACTION_JOURNAL
+    elif allowed_roots:
+        journal_file = allowed_roots[0] / "transaction_journal.json"
+    else:
+        journal_file = DEFAULT_TRANSACTION_JOURNAL
+
+    try:
+        recovered = check_and_recover_transactions(
+            journal_path=journal_file,
+            allowed_roots=allowed_roots,
+            backup_dir=Path(backup_dir) if backup_dir is not None else None,
+        )
+    except Exception as exc:
+        logger.critical(f"Startup crash recovery failed: {exc}. Refusing to start pipeline.")
+        raise RuntimeError(f"Startup crash recovery failed: {exc}") from exc
+
+    if recovered:
+        logger.critical(
+            "Transaction rollback completed. Repository has been restored to pre-trial baseline. "
+            "Halting pipeline execution to prevent overwriting without operator confirmation."
+        )
+        raise RuntimeError("Transaction rollback completed. Pipeline halted for safety review.")
+
     # 1. Ingest raw news
     raw_news = fetch_news(
         ticker=ticker,
@@ -1409,6 +2346,10 @@ def run_production_pipeline(
         chunk_days=chunk_days,
         client=client,
         retry_delay=retry_delay,
+        request_delay_seconds=request_delay_seconds,
+        staged_chunks_dir=effective_staged_chunks_dir,
+        manifest_path=effective_manifest_path,
+        max_cache_age_hours=max_cache_age_hours,
     )
 
     fetch_status = raw_news.attrs.get("status", STATUS_COMPLETE)
@@ -1420,11 +2361,29 @@ def run_production_pipeline(
         )
         return {"status": STATUS_FAILED, "raw_news_count": len(raw_news), "processed_count": 0, "covered_sessions": 0}
 
+    # Map successful chunks to trading sessions
+    successful_chunks = raw_news.attrs.get("successful_chunks", [])
+    successful_calendar_days = set()
+    for from_str, to_str in successful_chunks:
+        cur = pd.to_datetime(from_str).date()
+        end_cur = pd.to_datetime(to_str).date()
+        while cur <= end_cur:
+            successful_calendar_days.add(cur)
+            cur += dt.timedelta(days=1)
+
+    successful_trading_days = None
+    if market_file.exists():
+        market_df_check = pd.read_parquet(market_file)
+        successful_trading_days = [
+            d.date() for d in pd.to_datetime(market_df_check.index)
+            if d.date() in successful_calendar_days
+        ]
+
     if raw_news.empty:
         if fetch_status == STATUS_COMPLETE:
             logger.info(
                 f"News retrieval complete for {ticker} [{start_date} to {end_date}]: "
-                "confirmed zero articles published. Exiting pipeline."
+                "confirmed zero articles published."
             )
         elif fetch_status == STATUS_PARTIAL:
             logger.warning(
@@ -1433,58 +2392,160 @@ def run_production_pipeline(
             )
         else:
             logger.error("No news articles collected. Exiting pipeline.")
+
+        if full_rebuild and market_file.exists():
+            if backup_dir is None:
+                raise RuntimeError(
+                    "FATAL: Production pipeline execution requires an explicit, verified backup_dir before writing to datasets. "
+                    "Direct overwrite is strictly prohibited."
+                )
+            staged_market = market_file.with_name(market_file.name + ".stage")
+            merged = merge_sentiment_with_market_features(
+                market_features_path=market_file,
+                daily_sentiment_df=pd.DataFrame(),
+                output_path=staged_market,
+                full_rebuild=True,
+            )
+            commit_multi_file_transaction(
+                staged_targets=[(staged_market, market_file)],
+                backup_dir=backup_dir,
+                journal_path=journal_file,
+                allowed_roots=allowed_roots,
+            )
+            return {"status": fetch_status, "raw_news_count": 0, "processed_count": 0, "covered_sessions": int(merged["sentiment_coverage"].sum())}
+
+        # Check if existing processed sentiment has eligible records for requested successful trading sessions
+        if not full_rebuild and fetch_status == STATUS_COMPLETE and market_file.exists() and proc_file.exists() and successful_trading_days:
+            existing_proc_df = pd.read_parquet(proc_file)
+            if not existing_proc_df.empty and "trading_date" in existing_proc_df.columns:
+                existing_trading_dates = pd.to_datetime(existing_proc_df["trading_date"]).dt.date
+                eligible_mask = existing_trading_dates.isin(set(successful_trading_days))
+                if "ticker" in existing_proc_df.columns:
+                    eligible_mask = eligible_mask & (existing_proc_df["ticker"] == ticker)
+
+                if eligible_mask.any():
+                    logger.info(
+                        f"Found {int(eligible_mask.sum())} existing processed article(s) eligible for "
+                        f"{len(successful_trading_days)} requested trading session(s). Aggregating sentiment..."
+                    )
+                    if backup_dir is None:
+                        raise RuntimeError(
+                            "FATAL: Production pipeline execution requires an explicit, verified backup_dir before writing to datasets. "
+                            "Direct overwrite is strictly prohibited."
+                        )
+                    daily_sentiment = aggregate_daily_sentiment(existing_proc_df)
+                    staged_market = market_file.with_name(market_file.name + ".stage")
+                    merged_market = merge_sentiment_with_market_features(
+                        market_features_path=market_file,
+                        daily_sentiment_df=daily_sentiment,
+                        output_path=staged_market,
+                        successful_trading_days=successful_trading_days,
+                        full_rebuild=False,
+                    )
+                    covered_sessions = int(merged_market["sentiment_coverage"].sum())
+                    commit_multi_file_transaction(
+                        staged_targets=[(staged_market, market_file)],
+                        backup_dir=backup_dir,
+                        journal_path=journal_file,
+                        allowed_roots=allowed_roots,
+                    )
+                    raw_count = len(pd.read_parquet(raw_file)) if raw_file.exists() else 0
+                    return {
+                        "status": fetch_status,
+                        "raw_news_count": raw_count,
+                        "processed_count": len(existing_proc_df),
+                        "covered_sessions": covered_sessions,
+                    }
+
         return {"status": fetch_status, "raw_news_count": 0, "processed_count": 0, "covered_sessions": 0}
 
-    raw_news.to_parquet(raw_file)
-    logger.info(f"Saved {len(raw_news)} raw news articles to {raw_file}")
+    # Mandatory transaction safety check: before any writes, require verified backup_dir
+    if backup_dir is None:
+        raise RuntimeError(
+            "FATAL: Production pipeline execution requires an explicit, verified backup_dir before writing to datasets. "
+            "Direct overwrite is strictly prohibited."
+        )
 
-    # 2. Process sentiment with FinBERT and assign look-ahead-bias-free trading dates
-    processed_news = process_news_sentiment(
-        raw_news_df=raw_news,
-        batch_size=batch_size,
-        analyzer=analyzer,
-    )
-    processed_news.to_parquet(proc_file)
-    logger.info(f"Saved {len(processed_news)} processed news sentiment records to {proc_file}")
+    staged_raw = raw_file.with_name(raw_file.name + ".stage")
+    staged_proc = proc_file.with_name(proc_file.name + ".stage")
 
-    # 3. Aggregate daily sentiment by trading session
-    daily_sentiment = aggregate_daily_sentiment(processed_news)
+    # 2. Merge raw news archive
+    if full_rebuild:
+        merged_raw_df = deduplicate_articles(raw_news)
+        merged_raw_df.to_parquet(staged_raw)
+    else:
+        merged_raw_df = merge_raw_news_archive(raw_file, raw_news, output_path=staged_raw)
 
-    # 4. Merge daily sentiment into market_features.parquet
+    # 3. Process sentiment with FinBERT (net-new headlines only in incremental mode)
+    if full_rebuild:
+        final_processed_df = process_news_sentiment(
+            raw_news_df=merged_raw_df,
+            batch_size=batch_size,
+            analyzer=analyzer,
+        )
+        final_processed_df.to_parquet(staged_proc)
+    else:
+        if proc_file.exists():
+            existing_proc_df = pd.read_parquet(proc_file)
+            net_new_raw = get_net_new_articles(raw_news, existing_proc_df)
+            if not net_new_raw.empty:
+                logger.info(f"Identified {len(net_new_raw)} net-new headlines for FinBERT scoring.")
+                newly_processed = process_news_sentiment(
+                    raw_news_df=net_new_raw,
+                    batch_size=batch_size,
+                    analyzer=analyzer,
+                )
+                combined_proc = pd.concat([existing_proc_df, newly_processed], ignore_index=True)
+                final_processed_df = deduplicate_articles(combined_proc)
+                final_processed_df.to_parquet(staged_proc)
+            else:
+                logger.info("Zero net-new headlines identified. Skipping FinBERT inference.")
+                final_processed_df = existing_proc_df
+                shutil.copy2(proc_file, staged_proc)
+        else:
+            final_processed_df = process_news_sentiment(
+                raw_news_df=merged_raw_df,
+                batch_size=batch_size,
+                analyzer=analyzer,
+            )
+            final_processed_df.to_parquet(staged_proc)
+
+    # 4. Aggregate daily sentiment by trading session
+    daily_sentiment = aggregate_daily_sentiment(final_processed_df)
+
+    # 5. Commit with transaction journal
+    staged_items = [(staged_raw, raw_file), (staged_proc, proc_file)]
+
     covered_sessions = 0
     if market_file.exists():
-        # When collection is partial, restrict incremental refresh strictly to observed trading dates
-        # so historical sentiment on unretrieved/failed dates is preserved.
-        refresh_start = None if fetch_status == STATUS_PARTIAL else start_date
-        refresh_end = None if fetch_status == STATUS_PARTIAL else end_date
-
-        if fetch_status == STATUS_PARTIAL:
-            logger.warning(
-                "Finnhub collection was partial. Updating only trading sessions with retrieved news "
-                "to preserve historical sentiment for failed chunk windows."
-            )
-
-        merged = merge_sentiment_with_market_features(
+        staged_market = market_file.with_name(market_file.name + ".stage")
+        merged_market = merge_sentiment_with_market_features(
             market_features_path=market_file,
             daily_sentiment_df=daily_sentiment,
-            output_path=market_file,
-            refresh_start_date=refresh_start,
-            refresh_end_date=refresh_end,
+            output_path=staged_market,
+            successful_trading_days=successful_trading_days,
             full_rebuild=full_rebuild,
         )
-        covered_sessions = int(merged["sentiment_coverage"].sum())
+        covered_sessions = int(merged_market["sentiment_coverage"].sum())
+        staged_items.append((staged_market, market_file))
+
+    commit_multi_file_transaction(
+        staged_targets=staged_items,
+        backup_dir=backup_dir,
+        journal_path=journal_file,
+        allowed_roots=allowed_roots,
+    )
+
+    logger.info(f"Saved {len(merged_raw_df)} total raw news articles to {raw_file}")
+    logger.info(f"Saved {len(final_processed_df)} total processed news sentiment records to {proc_file}")
+    if market_file.exists():
         print("\nPipeline execution complete.")
-        print(f"Market features rows: {len(merged)}")
         print(f"Trading days with sentiment coverage: {covered_sessions}")
-    else:
-        logger.warning(
-            f"Market features file {market_file} not found. Skipping merge."
-        )
 
     return {
         "status": fetch_status,
-        "raw_news_count": len(raw_news),
-        "processed_count": len(processed_news),
+        "raw_news_count": len(merged_raw_df),
+        "processed_count": len(final_processed_df),
         "covered_sessions": covered_sessions,
     }
 
@@ -1538,20 +2599,42 @@ def main() -> None:
         action="store_true",
         help="Perform full sentiment rebuild replacing all historical sentiment across entire market dataset",
     )
+    parser.add_argument(
+        "--backup-dir",
+        type=str,
+        default=None,
+        help="Path to verified pre-transaction backup directory containing checksums.sha256",
+    )
+    parser.add_argument(
+        "--journal-path",
+        type=str,
+        default=None,
+        help="Path to write-ahead transaction journal JSON file",
+    )
     args = parser.parse_args()
 
     if args.test:
         run_test_mode(ticker=args.ticker)
         return
 
-    run_production_pipeline(
+    backup_dir = Path(args.backup_dir) if args.backup_dir else None
+    journal_path = Path(args.journal_path) if args.journal_path else None
+
+    result = run_production_pipeline(
         ticker=args.ticker,
         start_date=args.start_date,
         end_date=args.end_date,
         chunk_days=args.chunk_days,
         full_rebuild=args.full_rebuild,
         batch_size=args.batch_size,
+        backup_dir=backup_dir,
+        journal_path=journal_path,
     )
+
+    if isinstance(result, dict) and result.get("status") == STATUS_FAILED:
+        logger.error(f"Pipeline execution reported failure status: {result}")
+        sys.exit(1)
+
 
 
 if __name__ == "__main__":

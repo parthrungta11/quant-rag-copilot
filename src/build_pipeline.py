@@ -38,11 +38,20 @@ def run_stage_features() -> None:
     features_main()
 
 
-def run_stage_sentiment() -> None:
+def run_stage_sentiment(backup_dir: Path | str | None = None) -> None:
     """Execute Stage 3: News sentiment pipeline."""
     logger.info("Executing Stage 3: News Sentiment Ingestion & FinBERT Scoring...")
+    if not backup_dir:
+        logger.error(
+            "FATAL: Sentiment stage requires an explicit --backup-dir argument pointing to a verified "
+            "backup directory with checksums.sha256. Refusing to run without backup."
+        )
+        raise ValueError(
+            "Sentiment stage requires an explicit --backup-dir argument pointing to a verified "
+            "backup directory with checksums.sha256."
+        )
     from src.data_ingestion.news_sentiment import run_production_pipeline
-    run_production_pipeline()
+    run_production_pipeline(backup_dir=Path(backup_dir))
 
 
 def run_stage_forecasting() -> None:
@@ -87,6 +96,12 @@ def main() -> None:
         help="Pipeline stage to execute (default: forecasting).",
     )
     parser.add_argument(
+        "--backup-dir",
+        type=str,
+        default=None,
+        help="Path to verified pre-transaction backup directory containing checksums.sha256 (required for sentiment stage).",
+    )
+    parser.add_argument(
         "--test",
         action="store_true",
         help="Run comprehensive test suites for validation.",
@@ -98,18 +113,29 @@ def main() -> None:
         success = run_all_tests()
         sys.exit(0 if success else 1)
 
+    backup_path = Path(args.backup_dir) if args.backup_dir else None
+
     if args.stage == "market":
         run_stage_market()
     elif args.stage == "features":
         run_stage_features()
     elif args.stage == "sentiment":
-        run_stage_sentiment()
+        run_stage_sentiment(backup_dir=backup_path)
     elif args.stage == "forecasting":
         run_stage_forecasting()
     elif args.stage == "all":
+        if not backup_path:
+            logger.error(
+                "FATAL: Running all stages includes the sentiment stage, which requires an explicit "
+                "--backup-dir argument. Refusing to run without backup."
+            )
+            raise ValueError(
+                "Running all stages includes the sentiment stage, which requires an explicit "
+                "--backup-dir argument pointing to a verified backup directory with checksums.sha256."
+            )
         run_stage_market()
         run_stage_features()
-        run_stage_sentiment()
+        run_stage_sentiment(backup_dir=backup_path)
         run_stage_forecasting()
 
 

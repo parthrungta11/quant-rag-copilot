@@ -1,0 +1,11 @@
+{
+  "total_sessions": 451,
+  "covered_sessions": 40,
+  "missing_sessions": 411,
+  "news_raw_rows": 2556,
+  "news_sentiment_rows": 2556,
+  "unique_trading_dates": 42,
+  "baseline_covered_sessions": 34,
+  "baseline_missing_sessions": 417,
+  "verified_on": "2026-11-25"
+}
