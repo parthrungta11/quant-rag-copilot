@@ -883,10 +883,25 @@ def run_test_suite() -> bool:
     # --- Test 7: Production file isolation ---
     logger.info("Running Test 7: Production file isolation check...")
     if DEFAULT_MARKET_FEATURES_FILE.exists():
+        manifest_path = PROJECT_ROOT / "tests" / "fixtures" / "canonical_dataset_state.json"
+        with open(manifest_path, "r", encoding="utf-8") as f:
+            canonical_state = json.load(f)
         prod_df = pd.read_parquet(DEFAULT_MARKET_FEATURES_FILE)
-        assert len(prod_df) == 451, f"Production dataset corrupted! Expected 451 rows, got {len(prod_df)}."
-        assert prod_df["sentiment_score"].isna().sum() in (411, 416, 417), f"Production sentiment NaN count altered: {prod_df['sentiment_score'].isna().sum()}"
-        assert (prod_df["sentiment_coverage"] == 1).sum() in (34, 35, 40), f"Production covered count altered: {(prod_df['sentiment_coverage'] == 1).sum()}"
+        actual_total = len(prod_df)
+        actual_missing = int(prod_df["sentiment_score"].isna().sum())
+        actual_covered = int((prod_df["sentiment_coverage"] == 1).sum())
+        assert actual_total == canonical_state["total_sessions"], (
+            f"Production dataset corrupted! Expected {canonical_state['total_sessions']} rows, got {actual_total}."
+        )
+        assert actual_missing == canonical_state["missing_sessions"], (
+            f"Production sentiment NaN count altered: expected {canonical_state['missing_sessions']}, got {actual_missing}."
+        )
+        assert actual_covered == canonical_state["covered_sessions"], (
+            f"Production covered count altered: expected {canonical_state['covered_sessions']}, got {actual_covered}."
+        )
+        assert actual_covered + actual_missing == canonical_state["total_sessions"], (
+            f"Coverage invariant violated: {actual_covered} + {actual_missing} != {canonical_state['total_sessions']}."
+        )
     logger.info("Test 7 PASSED: Production file integrity verified.")
 
     # --- Test 8: Revised R2 formulas, zero-return baseline, edge cases, and tree inspector ---
