@@ -273,7 +273,7 @@ class TestPositionSizingAndMissingData(unittest.TestCase):
     def test_sentiment_coverage_alignment_warns_and_raises_strict(self) -> None:
         """Mismatched sentiment_coverage between predictions and market_data warns by default and raises if strict=True."""
         mkt = self.market_df.copy()
-        mkt["sentiment_coverage"] = [0, 1, 1, 0, 0]
+        mkt["sentiment_coverage"] = [0, 1, 1, 0]
         preds_df = pd.DataFrame(
             {
                 "ridge_hybrid_pred": [0.02, 0.02, 0.02],
