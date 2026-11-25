@@ -386,6 +386,7 @@ def run_backtest(
     model_name: str = "strategy",
     prediction_col: Optional[str] = None,
     threshold_series: Optional[pd.Series] = None,
+    strict: bool = False,
 ) -> BacktestResult:
     """Execute realistic out-of-sample portfolio simulation under verified price timing.
 
@@ -480,6 +481,27 @@ def run_backtest(
         if col not in market_data.columns:
             raise KeyError(f"market_data missing required column: '{col}'")
 
+    # Optional sentiment_coverage alignment check (backward-compatible warning; raises if strict=True)
+    if (
+        isinstance(predictions, pd.DataFrame)
+        and "sentiment_coverage" in predictions.columns
+        and "sentiment_coverage" in market_data.columns
+    ):
+        common_dates = predictions.index.intersection(market_data.index)
+        if len(common_dates) > 0:
+            pred_cov = predictions.loc[common_dates, "sentiment_coverage"].fillna(-1)
+            mkt_cov = market_data.loc[common_dates, "sentiment_coverage"].fillna(-1)
+            mismatches = int((pred_cov != mkt_cov).sum())
+            if mismatches > 0:
+                msg = (
+                    f"Sentiment coverage mismatch between predictions and market_data on "
+                    f"{mismatches}/{len(common_dates)} overlapping session(s). "
+                    "Predictions may be stale relative to market_data."
+                )
+                logger.warning(msg)
+                if strict:
+                    raise ValueError(msg)
+
     # 3. Align chronological execution sessions
     market_index = market_data.index
     market_loc_map = {ts: idx for idx, ts in enumerate(market_index)}
@@ -524,13 +546,18 @@ def run_backtest(
             current_thresh = float(config.conviction_threshold)
 
         # Validate prices
+        invalid_prices = False
         if pd.isna(open_t1) or pd.isna(close_t1) or open_t1 <= 0 or close_t1 <= 0:
-            logger.warning(f"Invalid execution prices at session {exec_date} (Open={open_t1}, Close={close_t1}); defaulting to Cash.")
-            target_pos = 0.0
+            logger.warning(
+                f"Invalid execution prices at session {exec_date} (Open={open_t1}, Close={close_t1}); "
+                "carrying previous position unchanged with zero friction."
+            )
+            target_pos = prev_position
             asset_ret = 0.0
             entry_price = float(open_t1) if pd.notna(open_t1) else np.nan
             exit_price = float(close_t1) if pd.notna(close_t1) else np.nan
             exit_date = exec_date
+            invalid_prices = True
         elif config.execution_mode == "next_open_to_close":
             target_pos = map_prediction_to_position(pred_val, config, threshold=current_thresh)
             entry_price = float(open_t1)
@@ -554,19 +581,26 @@ def run_backtest(
         else:
             raise ValueError(f"Unsupported execution_mode: {config.execution_mode}")
 
-        # Position Turnover & Transaction Friction
-        turnover = abs(target_pos - prev_position)
-        friction_cost = turnover * one_way_cost_rate
-
-        # Short Borrow Cost (applied only while short)
-        if target_pos < 0.0:
-            borrow_cost = abs(target_pos) * borrow_rate_per_session
-        else:
+        if invalid_prices:
+            turnover = 0.0
+            friction_cost = 0.0
             borrow_cost = 0.0
+            strat_gross = 0.0
+            strat_net = 0.0
+        else:
+            # Position Turnover & Transaction Friction
+            turnover = abs(target_pos - prev_position)
+            friction_cost = turnover * one_way_cost_rate
 
-        # Strategy Returns
-        strat_gross = target_pos * asset_ret
-        strat_net = strat_gross - friction_cost - borrow_cost
+            # Short Borrow Cost (applied only while short)
+            if target_pos < 0.0:
+                borrow_cost = abs(target_pos) * borrow_rate_per_session
+            else:
+                borrow_cost = 0.0
+
+            # Strategy Returns
+            strat_gross = target_pos * asset_ret
+            strat_net = strat_gross - friction_cost - borrow_cost
 
         # Buy & Hold AAPL Benchmark Return for the identical session
         # (Evaluated on the exact same price path: Open[t+1] to Close[t+1] or Open[t+1] to Open[t+2])

@@ -247,9 +247,48 @@ class TestPositionSizingAndMissingData(unittest.TestCase):
         res = run_backtest(preds, corrupted_market)
         history = res.portfolio_history
 
-        # Period 1 executed at t1 had NaN Open -> defaulted to position=0.0, return=0.0
+        # Period 1 executed at t1 had NaN Open -> carried prev_position=0.0, return=0.0
         self.assertEqual(history.iloc[0]["position"], 0.0)
         self.assertAlmostEqual(history.iloc[0]["strategy_net_return"], 0.0)
+
+    def test_invalid_prices_carry_previous_position_with_zero_friction(self) -> None:
+        """If a prior position is held and next execution prices are invalid, carry position with 0 friction."""
+        corrupted_market = self.market_df.copy()
+        # t1 is valid (enters +1.0), t2 has NaN Open
+        corrupted_market.iloc[2, corrupted_market.columns.get_loc("Open")] = np.nan
+
+        preds = pd.Series([0.05, -0.05, 0.05], index=self.dates[:3])
+        res = run_backtest(preds, corrupted_market)
+        history = res.portfolio_history
+
+        # Period 1 (executed at t1): enters +1.0
+        self.assertEqual(history.iloc[0]["position"], 1.0)
+        # Period 2 (executed at t2, NaN Open): carries +1.0 unchanged with 0 turnover and 0 friction
+        self.assertEqual(history.iloc[1]["position"], 1.0)
+        self.assertEqual(history.iloc[1]["turnover"], 0.0)
+        self.assertEqual(history.iloc[1]["friction_cost"], 0.0)
+        self.assertEqual(history.iloc[1]["borrow_cost"], 0.0)
+        self.assertAlmostEqual(history.iloc[1]["strategy_net_return"], 0.0)
+
+    def test_sentiment_coverage_alignment_warns_and_raises_strict(self) -> None:
+        """Mismatched sentiment_coverage between predictions and market_data warns by default and raises if strict=True."""
+        mkt = self.market_df.copy()
+        mkt["sentiment_coverage"] = [0, 1, 1, 0, 0]
+        preds_df = pd.DataFrame(
+            {
+                "ridge_hybrid_pred": [0.02, 0.02, 0.02],
+                "sentiment_coverage": [0, 0, 1],  # disagrees at index[1]
+            },
+            index=self.dates[:3],
+        )
+
+        with self.assertLogs("backtest_engine", level="WARNING") as cm:
+            res = run_backtest(preds_df, mkt, prediction_col="ridge_hybrid_pred")
+        self.assertTrue(any("Sentiment coverage mismatch" in msg for msg in cm.output))
+        self.assertEqual(len(res.portfolio_history), 3)
+
+        with self.assertRaises(ValueError):
+            run_backtest(preds_df, mkt, prediction_col="ridge_hybrid_pred", strict=True)
 
 
 class TestMetricsAndBenchmarkIntegrity(unittest.TestCase):
