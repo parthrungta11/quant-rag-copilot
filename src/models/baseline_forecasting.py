@@ -659,7 +659,7 @@ def compute_evaluation_metrics(predictions_df: pd.DataFrame) -> Dict[str, Any]:
                 "r2_descriptive_test_mean": "1 - sum((y - y_hat)^2) / sum((y - mean(y_test))^2). Descriptive test-period variance explained relative to in-sample test-period mean."
             },
             "statistical_limitation_notice": (
-                "The sentiment-covered test subset contains only 33 evaluated sessions. "
+                f"The sentiment-covered test subset contains only {len(covered_df)} evaluated sessions. "
                 "Confidence intervals are wide, and results must be interpreted as exploratory proof-of-concept "
                 "rather than statistically significant alpha at p < 0.05."
             ),
