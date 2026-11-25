@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import sys
 from pathlib import Path
+from typing import Any, Dict
 
 import pandas as pd
 
@@ -22,16 +23,22 @@ NEWS_SENTIMENT_PATH = PROJECT_ROOT / "data" / "processed" / "news_sentiment.parq
 FORECAST_PREDS_PATH = PROJECT_ROOT / "data" / "processed" / "forecast_predictions.parquet"
 
 
-def main() -> int:
-    if not MANIFEST_PATH.exists():
-        print(f"[ERROR] Manifest missing: {MANIFEST_PATH}", file=sys.stderr)
-        return 1
+def check_data_state(
+    manifest_path: Path = MANIFEST_PATH,
+    market_features_path: Path = MARKET_FEATURES_PATH,
+    news_raw_path: Path = NEWS_RAW_PATH,
+    news_sentiment_path: Path = NEWS_SENTIMENT_PATH,
+    forecast_preds_path: Path = FORECAST_PREDS_PATH,
+) -> Dict[str, Any]:
+    """Inspect dataset counts and staleness strictly read-only."""
+    if not manifest_path.exists():
+        raise FileNotFoundError(f"Manifest missing: {manifest_path}")
 
-    manifest = json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
 
-    mkt = pd.read_parquet(MARKET_FEATURES_PATH)
-    raw = pd.read_parquet(NEWS_RAW_PATH)
-    proc = pd.read_parquet(NEWS_SENTIMENT_PATH)
+    mkt = pd.read_parquet(market_features_path)
+    raw = pd.read_parquet(news_raw_path)
+    proc = pd.read_parquet(news_sentiment_path)
 
     actual = {
         "total_sessions": int(len(mkt)),
@@ -42,34 +49,58 @@ def main() -> int:
         "unique_trading_dates": int(proc["trading_date"].nunique()),
     }
 
+    mismatches = [k for k, v in actual.items() if v != manifest.get(k)]
+
+    is_stale = False
+    preds_cov = None
+    preds_len = None
+    if forecast_preds_path.exists():
+        preds = pd.read_parquet(forecast_preds_path)
+        preds_len = int(len(preds))
+        preds_cov = int((preds["sentiment_coverage"] == 1).sum())
+        mkt_mtime = market_features_path.stat().st_mtime
+        preds_mtime = forecast_preds_path.stat().st_mtime
+        if preds_cov < actual["covered_sessions"] or preds_mtime < mkt_mtime:
+            is_stale = True
+
+    return {
+        "verified_on": manifest.get("verified_on"),
+        "manifest": manifest,
+        "actual": actual,
+        "mismatches": mismatches,
+        "forecast_rows": preds_len,
+        "forecast_covered_sessions": preds_cov,
+        "is_stale": is_stale,
+    }
+
+
+def main() -> int:
+    try:
+        report = check_data_state()
+    except FileNotFoundError as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
     print("=== Canonical Dataset State Check (Read-Only) ===")
-    print(f"Manifest verified_on: {manifest.get('verified_on')}")
-    mismatches = []
-    for key, val in actual.items():
-        expected = manifest.get(key)
+    print(f"Manifest verified_on: {report['verified_on']}")
+    for key, val in report["actual"].items():
+        expected = report["manifest"].get(key)
         status = "OK" if val == expected else f"MISMATCH (expected {expected})"
         print(f"  {key:<24}: {val:<6} [{status}]")
-        if val != expected:
-            mismatches.append(key)
 
-    if FORECAST_PREDS_PATH.exists():
-        preds = pd.read_parquet(FORECAST_PREDS_PATH)
-        preds_cov = int((preds["sentiment_coverage"] == 1).sum())
-        mkt_mtime = MARKET_FEATURES_PATH.stat().st_mtime
-        preds_mtime = FORECAST_PREDS_PATH.stat().st_mtime
+    if report["forecast_rows"] is not None:
         print("\n=== Forecast Predictions Staleness Check ===")
-        print(f"  forecast_predictions rows            : {len(preds)}")
-        print(f"  forecast_predictions covered_sessions: {preds_cov}")
-        if preds_cov < actual["covered_sessions"] or preds_mtime < mkt_mtime:
+        print(f"  forecast_predictions rows            : {report['forecast_rows']}")
+        print(f"  forecast_predictions covered_sessions: {report['forecast_covered_sessions']}")
+        if report["is_stale"]:
             print(
-                f"  [STALE] forecast_predictions.parquet ({preds_cov} covered sessions, "
-                f"mtime={preds_mtime:.0f}) is stale relative to market_features.parquet "
-                f"({actual['covered_sessions']} covered sessions, mtime={mkt_mtime:.0f})."
+                f"  [STALE] forecast_predictions.parquet ({report['forecast_covered_sessions']} covered sessions) "
+                f"is stale relative to market_features.parquet ({report['actual']['covered_sessions']} covered sessions)."
             )
         else:
             print("  [OK] forecast_predictions.parquet is up to date.")
 
-    return 1 if mismatches else 0
+    return 1 if report["mismatches"] else 0
 
 
 if __name__ == "__main__":
